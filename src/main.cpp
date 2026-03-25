@@ -94,6 +94,13 @@ bool led_state = false;
 bool ledState  = false;
 unsigned long bleAdvertisingStart = 0;
 
+// ==================== WiFi 重连状态 ====================
+unsigned long lastReconnectAttempt = 0;
+int           reconnectAttempts    = 0;
+// 退避间隔：10s → 20s → 40s → 60s（上限）
+#define RECONNECT_BASE_MS  10000UL
+#define RECONNECT_MAX_MS   60000UL
+
 // ==================== 配网状态 ====================
 bool provClientConnected  = false;
 volatile bool provCommitPending = false;
@@ -125,6 +132,8 @@ void initWakeupBLE();
 void startBLEAdvertising();
 void stopBLEAdvertising();
 void handleBLEAdvertising();
+void handleWiFiReconnect();
+void ensureBafaConnected();
 std::string hexToBytes(const String& hex);
 
 // =====================================================
@@ -449,6 +458,62 @@ void send_heartbeat() {
 }
 
 // =====================================================
+// WiFi 自动重连（非阻塞，指数退避）
+// =====================================================
+
+void handleWiFiReconnect() {
+    if (WiFi.status() == WL_CONNECTED) {
+        if (current_status == STATUS_CONNECTING) {
+            // 刚重连成功
+            current_status     = STATUS_CONNECTED;
+            reconnectAttempts  = 0;
+            lastReconnectAttempt = 0;
+            Serial.println("✅ WiFi 重连成功");
+            Serial.println("   IP:   " + WiFi.localIP().toString());
+            Serial.println("   RSSI: " + String(WiFi.RSSI()) + " dBm");
+        }
+        return;
+    }
+
+    // 刚断线：记录状态，断开巴法云
+    if (current_status == STATUS_CONNECTED) {
+        current_status       = STATUS_CONNECTING;
+        reconnectAttempts    = 0;
+        lastReconnectAttempt = 0;
+        client.stop();
+        Serial.println("⚠️  WiFi 断线，启动自动重连...");
+    }
+
+    // 计算退避间隔：10s * 2^attempt，上限60s
+    unsigned long backoff = RECONNECT_BASE_MS * (1UL << min(reconnectAttempts, 3));
+    if (backoff > RECONNECT_MAX_MS) backoff = RECONNECT_MAX_MS;
+
+    if (millis() - lastReconnectAttempt < backoff) return;
+
+    reconnectAttempts++;
+    lastReconnectAttempt = millis();
+    Serial.printf("🔄 WiFi 重连尝试 #%d (下次退避 %lus)...\n",
+                  reconnectAttempts,
+                  min(RECONNECT_BASE_MS * (1UL << min(reconnectAttempts, 3)),
+                      RECONNECT_MAX_MS) / 1000);
+
+    WiFi.disconnect(false);
+    WiFi.begin(wifi_ssid_buf, wifi_pass_buf);
+}
+
+// =====================================================
+// 确保巴法云 TCP 连接正常（WiFi 已连接时调用）
+// =====================================================
+
+void ensureBafaConnected() {
+    if (!client.connected()) {
+        Serial.println("🔗 巴法云连接断开，重新连接...");
+        client.stop();
+        connect_server();
+    }
+}
+
+// =====================================================
 // 工具函数
 // =====================================================
 
@@ -600,19 +665,17 @@ void loop() {
     checkButton();
     updateStatusLED();
 
-    // WiFi 断线监测
-    if (current_status == STATUS_CONNECTED && WiFi.status() != WL_CONNECTED) {
-        Serial.println("⚠️  WiFi 断线，尝试重连...");
-        current_status = STATUS_CONNECTING;
-        if (connectWiFi()) {
-            current_status = STATUS_CONNECTED;
-            connect_server();
-        } else {
-            Serial.println("📡 重连失败，进入 BLE 配网模式");
-            startProvBLE();
-            return;
-        }
+    // WiFi 自动重连（非阻塞）
+    handleWiFiReconnect();
+
+    // WiFi 未连接时跳过后续网络操作
+    if (current_status != STATUS_CONNECTED) {
+        delay(100);
+        return;
     }
+
+    // 确保巴法云 TCP 连接正常
+    ensureBafaConnected();
 
     // 处理巴法云消息
     if (client.available()) {

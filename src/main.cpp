@@ -20,7 +20,7 @@
  */
 
 #include <Matter.h>
-#include <MatterOnOffLight.h>
+#include <MatterEndpoints/MatterOnOffLight.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>

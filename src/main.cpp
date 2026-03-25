@@ -1,25 +1,29 @@
 /**
  * Matter + BLE 唤醒小爱音箱 (ESP32-C3)
- * 版本: 4.0 - 接入米家 Matter 协议
+ * 版本: 4.1 - 接入米家 Matter 协议
  *
  * 配网流程（首次使用）：
- *   1. 上电后 LED 快闪，串口打印配对码
- *   2. 打开米家 App → 添加设备 → 扫码 / 手动输入配对码
- *   3. Matter 自动完成 WiFi 配置，无需手动操作
- *   4. 配对成功后 LED 慢闪，设备出现在米家 App
+ *   1. 上电后 LED 快闪，设备自动开启配对引导 WiFi
+ *   2. 手机连接 WiFi "ESP32_Matter_Setup"（密码见 SETUP_AP_PASSWORD）
+ *   3. 浏览器访问 192.168.4.1，查看 Matter 配对码 / 二维码链接
+ *   4. 断开引导 WiFi，打开米家 App → 添加设备 → 扫码 / 手动输入配对码
+ *   5. Matter 自动完成 WiFi 配置，配对成功后引导 WiFi 自动关闭
+ *   6. 配对成功后 LED 慢闪，设备出现在米家 App
  *
  * 日常使用：
  *   - 米家 App / 小爱音箱发出"开"指令 → 发送 BLE 广播唤醒目标设备
  *   - 米家 App 发出"关"指令 → 停止 BLE 广播
  *
  * 按键操作：
- *   短按 → 未配对：重新打印配对码；已配对：手动触发 BLE 广播测试
+ *   短按 → 未配对：重启引导 WiFi；已配对：手动触发 BLE 广播测试
  *   长按(>3s) → 出厂重置（Matter 解配对 + 清除所有配置）
  */
 
 #include <Matter.h>
 #include <MatterOnOffLight.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include "esp_system.h"
 #include "esp_task_wdt.h"
 #include <BLEDevice.h>
@@ -39,6 +43,10 @@
 
 // ==================== BLE 设备名（唤醒模式）====================
 #define BLE_DEVICE_NAME "ESP32C3_BLE_Beacon"
+
+// ==================== 配对引导 WiFi AP ====================
+#define SETUP_AP_SSID     "ESP32_Matter_Setup"
+#define SETUP_AP_PASSWORD "12345678"
 
 // ==================== 配置默认值 ====================
 const char* DEFAULT_BLE_MAC  = "78:81:8c:06:9a:c4";
@@ -87,10 +95,14 @@ volatile bool pendingBLEStop  = false;
 // ==================== 对象 ====================
 Preferences      prefs;
 MatterOnOffLight MatterLight;
+WebServer        setupServer(80);
+bool             apActive = false;
 
 // ==================== 函数声明 ====================
 void loadConfig();
 void saveConfig(const String& mac, const String& data);
+void startSetupAP();
+void stopSetupAP();
 void initWakeupBLE();
 void startBLEAdvertising();
 void stopBLEAdvertising();
@@ -133,6 +145,63 @@ void loadConfig() {
     strncpy(ble_mac_buf,  mac.c_str(),  sizeof(ble_mac_buf) - 1);
     strncpy(ble_data_buf, data.c_str(), sizeof(ble_data_buf) - 1);
     Serial.println("✅ 配置已加载 - BLE MAC: " + mac);
+}
+
+// =====================================================
+// 配对引导 WiFi AP（未配对时开启，配对后关闭）
+// =====================================================
+
+void startSetupAP() {
+    if (apActive) return;
+
+    WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD);
+
+    setupServer.on("/", []() {
+        String code  = Matter.getManualPairingCode();
+        String qrUrl = Matter.getOnboardingQRCodeUrl();
+        String html =
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<style>"
+            "body{font-family:sans-serif;padding:20px;max-width:420px;margin:auto;color:#333}"
+            "h2{margin-bottom:4px} .sub{color:#888;font-size:.9em;margin-top:0}"
+            ".code{font-size:2em;font-weight:bold;color:#e74c3c;letter-spacing:3px;"
+            "background:#fff5f5;padding:12px;border-radius:8px;text-align:center;margin:16px 0}"
+            ".btn{display:block;background:#07c160;color:#fff;padding:14px;text-align:center;"
+            "text-decoration:none;border-radius:8px;font-size:1.1em;margin:12px 0}"
+            "ol{padding-left:20px;line-height:2}"
+            "</style></head><body>"
+            "<h2>Matter 配对</h2>"
+            "<p class='sub'>请按以下步骤完成米家配网</p>"
+            "<p style='margin-bottom:4px'>手动配对码：</p>"
+            "<div class='code'>" + code + "</div>"
+            "<a href='" + qrUrl + "' class='btn'>点击生成二维码 →</a>"
+            "<hr>"
+            "<ol>"
+            "<li>记下配对码（或点击上方按钮生成二维码截图）</li>"
+            "<li>断开此 WiFi，重新连接家庭网络</li>"
+            "<li>打开<b>米家 App</b> → 添加设备</li>"
+            "<li>扫描截图中的二维码，或手动输入配对码</li>"
+            "</ol>"
+            "<p style='color:#aaa;font-size:.85em'>配对成功后此页面自动关闭</p>"
+            "</body></html>";
+        setupServer.send(200, "text/html; charset=utf-8", html);
+    });
+
+    setupServer.begin();
+    apActive = true;
+    Serial.println("📶 引导 WiFi: " + String(SETUP_AP_SSID)
+                   + "  密码: " + String(SETUP_AP_PASSWORD));
+    Serial.println("   浏览器访问: http://192.168.4.1");
+}
+
+void stopSetupAP() {
+    if (!apActive) return;
+    setupServer.stop();
+    WiFi.softAPdisconnect(true);
+    apActive = false;
+    Serial.println("📴 引导 WiFi 已关闭");
 }
 
 // =====================================================
@@ -247,12 +316,11 @@ void checkButton() {
             }
             safeRestart("出厂重置完成");
         } else {
-            // 短按：显示配对信息 或 手动测试
+            // 短按：重启引导 WiFi 或 手动测试 BLE
             if (!Matter.isDeviceCommissioned()) {
-                Serial.println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                Serial.println("  手动配对码: " + Matter.getManualPairingCode());
-                Serial.println("  二维码链接: " + Matter.getOnboardingQRCodeUrl());
-                Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+                Serial.println("🔘 短按: 重启引导 WiFi");
+                stopSetupAP();
+                startSetupAP();
             } else {
                 Serial.println("🔘 短按: 手动触发 BLE 唤醒广播 (测试)");
                 if (bleInitialized) startBLEAdvertising();
@@ -298,16 +366,9 @@ void setup() {
 
     if (!Matter.isDeviceCommissioned()) {
         current_status = STATUS_COMMISSIONING;
-        Serial.println("\n⚠️  Matter 尚未与米家配对！");
-        Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        Serial.println("  1. 打开米家 App → 添加设备");
-        Serial.println("  2. 扫描二维码 或 手动输入配对码");
-        Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        Serial.println("  手动配对码: " + Matter.getManualPairingCode());
-        Serial.println("  二维码链接: " + Matter.getOnboardingQRCodeUrl());
-        Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        startSetupAP();
         Serial.println("  LED 快闪 = 等待配对");
-        Serial.println("  短按按钮 = 重新打印配对信息\n");
+        Serial.println("  短按按钮 = 重启引导 WiFi\n");
     } else {
         current_status = STATUS_CONNECTED;
         Serial.println("✅ Matter 已配对，设备正常运行");
@@ -321,6 +382,7 @@ void setup() {
 
 void loop() {
     esp_task_wdt_reset();
+    if (apActive) setupServer.handleClient();
     checkButton();
     updateStatusLED();
     handleBLEAdvertising();
@@ -342,6 +404,7 @@ void loop() {
         prevCommissioned = true;
         current_status   = STATUS_CONNECTED;
         Serial.println("🎉 Matter 配对成功！设备已加入米家");
+        stopSetupAP();
         delay(1000); // 等待 Matter BLE 栈完全释放
         initWakeupBLE();
     }

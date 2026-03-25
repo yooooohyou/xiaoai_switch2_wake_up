@@ -152,11 +152,25 @@ void loadConfig() {
 // Web 配置页（AP 模式 + 配对后 LAN 模式复用同一套路由）
 // =====================================================
 
+// 从 getOnboardingQRCodeUrl() 返回的 URL 中提取 MT:... 载荷
+// URL 格式: https://project-chip.github.io/...?data=MT%3AYYYY
+static String extractQRPayload(const String& url) {
+    int idx = url.indexOf("data=");
+    if (idx < 0) return url;
+    String payload = url.substring(idx + 5);
+    payload.replace("%3A", ":");
+    payload.replace("%3a", ":");
+    // 去掉 & 后面的其他参数
+    int amp = payload.indexOf('&');
+    if (amp >= 0) payload = payload.substring(0, amp);
+    return payload;
+}
+
 // 返回完整 HTML 页面（commissioned 决定是否显示 Matter 配对区）
 String buildConfigPage(bool commissioned) {
-    String code  = commissioned ? "" : Matter.getManualPairingCode();
-    String qrUrl = commissioned ? "" : Matter.getOnboardingQRCodeUrl();
-    String ip    = commissioned ? WiFi.localIP().toString() : "192.168.4.1";
+    String code    = commissioned ? "" : Matter.getManualPairingCode();
+    String qrPayload = commissioned ? "" : extractQRPayload(Matter.getOnboardingQRCodeUrl());
+    String ip      = commissioned ? WiFi.localIP().toString() : "192.168.4.1";
 
     String html =
         "<!DOCTYPE html><html><head>"
@@ -167,8 +181,7 @@ String buildConfigPage(bool commissioned) {
         "h2{margin-bottom:2px} .sub{color:#888;font-size:.9em;margin:0 0 16px}"
         ".code{font-size:1.8em;font-weight:bold;color:#e74c3c;letter-spacing:3px;"
         "background:#fff5f5;padding:10px;border-radius:8px;text-align:center;margin:12px 0}"
-        ".btn{display:block;background:#07c160;color:#fff;padding:12px;text-align:center;"
-        "text-decoration:none;border-radius:8px;font-size:1em;margin:10px 0}"
+        "#qrbox{text-align:center;margin:14px 0}"
         "label{display:block;margin-top:14px;font-weight:bold;font-size:.9em}"
         "input[type=text]{width:100%;box-sizing:border-box;padding:9px;border:1px solid #ddd;"
         "border-radius:6px;font-size:.95em;margin-top:4px}"
@@ -180,11 +193,17 @@ String buildConfigPage(bool commissioned) {
 
     // ---- Matter 配对区（仅未配对时显示）----
     if (!commissioned) {
+        // jsDelivr CDN 在国内可访问；qrcode.js 客户端生成二维码，无需外部网站
         html += "<h2>Matter 配对</h2>"
-                "<p class='sub'>先填写 BLE 配置，再去米家扫码</p>"
-                "<p style='margin-bottom:4px'>手动配对码：</p>"
+                "<p class='sub'>用米家 App 扫描下方二维码完成配对</p>"
+                "<div id='qrbox'><canvas id='qr'></canvas></div>"
+                "<p style='margin-bottom:4px'>手动配对码（扫码失败时输入）：</p>"
                 "<div class='code'>" + code + "</div>"
-                "<a href='" + qrUrl + "' class='btn'>点击生成二维码 →</a>"
+                "<script src='https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js'></script>"
+                "<script>"
+                "QRCode.toCanvas(document.getElementById('qr'),'" + qrPayload + "',"
+                "{width:220,margin:2},function(e){if(e){document.getElementById('qrbox').innerText='二维码载荷: " + qrPayload + "';}})"
+                "</script>"
                 "<hr>";
     } else {
         html += "<h2>BLE 唤醒配置</h2>"

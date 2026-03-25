@@ -1,5 +1,5 @@
-# ESP32-C3 分区表 (4MB Flash) - Matter 版
-# Matter 需要独立的 matter_kvs NVS 分区存储配对凭据
+# ESP32-C3 Partition Table (4MB Flash) - Matter build
+# Matter requires a dedicated matter_kvs NVS partition for pairing credentials
 #
 # Name,      Type, SubType,  Offset,   Size,    Flags
 nvs,         data, nvs,      0x9000,   0x5000,

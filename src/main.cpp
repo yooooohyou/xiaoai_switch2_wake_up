@@ -24,6 +24,7 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
 #include "esp_system.h"
 #include "esp_task_wdt.h"
 #include <BLEDevice.h>
@@ -148,47 +149,101 @@ void loadConfig() {
 }
 
 // =====================================================
-// 配对引导 WiFi AP（未配对时开启，配对后关闭）
+// Web 配置页（AP 模式 + 配对后 LAN 模式复用同一套路由）
 // =====================================================
+
+// 返回完整 HTML 页面（commissioned 决定是否显示 Matter 配对区）
+String buildConfigPage(bool commissioned) {
+    String code  = commissioned ? "" : Matter.getManualPairingCode();
+    String qrUrl = commissioned ? "" : Matter.getOnboardingQRCodeUrl();
+    String ip    = commissioned ? WiFi.localIP().toString() : "192.168.4.1";
+
+    String html =
+        "<!DOCTYPE html><html><head>"
+        "<meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<style>"
+        "body{font-family:sans-serif;padding:20px;max-width:460px;margin:auto;color:#333}"
+        "h2{margin-bottom:2px} .sub{color:#888;font-size:.9em;margin:0 0 16px}"
+        ".code{font-size:1.8em;font-weight:bold;color:#e74c3c;letter-spacing:3px;"
+        "background:#fff5f5;padding:10px;border-radius:8px;text-align:center;margin:12px 0}"
+        ".btn{display:block;background:#07c160;color:#fff;padding:12px;text-align:center;"
+        "text-decoration:none;border-radius:8px;font-size:1em;margin:10px 0}"
+        "label{display:block;margin-top:14px;font-weight:bold;font-size:.9em}"
+        "input[type=text]{width:100%;box-sizing:border-box;padding:9px;border:1px solid #ddd;"
+        "border-radius:6px;font-size:.95em;margin-top:4px}"
+        "input[type=submit]{width:100%;background:#1989fa;color:#fff;border:none;padding:12px;"
+        "border-radius:8px;font-size:1em;margin-top:16px;cursor:pointer}"
+        "hr{border:none;border-top:1px solid #eee;margin:20px 0}"
+        ".ok{color:#07c160;font-weight:bold}"
+        "</style></head><body>";
+
+    // ---- Matter 配对区（仅未配对时显示）----
+    if (!commissioned) {
+        html += "<h2>Matter 配对</h2>"
+                "<p class='sub'>先填写 BLE 配置，再去米家扫码</p>"
+                "<p style='margin-bottom:4px'>手动配对码：</p>"
+                "<div class='code'>" + code + "</div>"
+                "<a href='" + qrUrl + "' class='btn'>点击生成二维码 →</a>"
+                "<hr>";
+    } else {
+        html += "<h2>BLE 唤醒配置</h2>"
+                "<p class='sub'>设备已接入米家，可随时修改唤醒目标</p>";
+    }
+
+    // ---- BLE 配置表单 ----
+    html += "<form method='POST' action='/save'>"
+            "<label>目标设备 BLE MAC</label>"
+            "<input type='text' name='mac' value='" + String(ble_mac_buf) + "' "
+            "placeholder='78:81:8c:06:9a:c4' pattern='^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$' required>"
+            "<label>BLE 广播数据（HEX，不含空格）</label>"
+            "<input type='text' name='data' value='" + String(ble_data_buf) + "' "
+            "placeholder='0201061BFF...' pattern='^[0-9a-fA-F]+$' required>"
+            "<input type='submit' value='保存并重启'>"
+            "</form>";
+
+    if (!commissioned) {
+        html += "<hr><p style='font-size:.85em;color:#aaa'>"
+                "配对成功后可通过 <b>http://" + ip + "</b> 或 "
+                "<b>http://esp32c3-wake.local</b> 继续访问此页面</p>";
+    }
+
+    html += "</body></html>";
+    return html;
+}
+
+void registerWebRoutes() {
+    setupServer.on("/", HTTP_GET, []() {
+        setupServer.send(200, "text/html; charset=utf-8",
+                         buildConfigPage(Matter.isDeviceCommissioned()));
+    });
+
+    setupServer.on("/save", HTTP_POST, []() {
+        String mac  = setupServer.arg("mac");
+        String data = setupServer.arg("data");
+
+        if (mac.length() > 0 && data.length() > 0) {
+            if (prefs.begin("config", false)) {
+                prefs.putString("ble_mac",  mac);
+                prefs.putString("ble_data", data);
+                prefs.end();
+            }
+            setupServer.send(200, "text/html; charset=utf-8",
+                "<meta charset='UTF-8'>"
+                "<p style='font-family:sans-serif;padding:20px'>"
+                "✅ 已保存，设备重启中...</p>");
+            delay(800);
+            ESP.restart();
+        } else {
+            setupServer.send(400, "text/plain", "参数缺失");
+        }
+    });
+}
 
 void startSetupAP() {
     if (apActive) return;
-
     WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD);
-
-    setupServer.on("/", []() {
-        String code  = Matter.getManualPairingCode();
-        String qrUrl = Matter.getOnboardingQRCodeUrl();
-        String html =
-            "<!DOCTYPE html><html><head>"
-            "<meta charset='UTF-8'>"
-            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            "<style>"
-            "body{font-family:sans-serif;padding:20px;max-width:420px;margin:auto;color:#333}"
-            "h2{margin-bottom:4px} .sub{color:#888;font-size:.9em;margin-top:0}"
-            ".code{font-size:2em;font-weight:bold;color:#e74c3c;letter-spacing:3px;"
-            "background:#fff5f5;padding:12px;border-radius:8px;text-align:center;margin:16px 0}"
-            ".btn{display:block;background:#07c160;color:#fff;padding:14px;text-align:center;"
-            "text-decoration:none;border-radius:8px;font-size:1.1em;margin:12px 0}"
-            "ol{padding-left:20px;line-height:2}"
-            "</style></head><body>"
-            "<h2>Matter 配对</h2>"
-            "<p class='sub'>请按以下步骤完成米家配网</p>"
-            "<p style='margin-bottom:4px'>手动配对码：</p>"
-            "<div class='code'>" + code + "</div>"
-            "<a href='" + qrUrl + "' class='btn'>点击生成二维码 →</a>"
-            "<hr>"
-            "<ol>"
-            "<li>记下配对码（或点击上方按钮生成二维码截图）</li>"
-            "<li>断开此 WiFi，重新连接家庭网络</li>"
-            "<li>打开<b>米家 App</b> → 添加设备</li>"
-            "<li>扫描截图中的二维码，或手动输入配对码</li>"
-            "</ol>"
-            "<p style='color:#aaa;font-size:.85em'>配对成功后此页面自动关闭</p>"
-            "</body></html>";
-        setupServer.send(200, "text/html; charset=utf-8", html);
-    });
-
+    registerWebRoutes();
     setupServer.begin();
     apActive = true;
     Serial.println("📶 引导 WiFi: " + String(SETUP_AP_SSID)
@@ -198,10 +253,23 @@ void startSetupAP() {
 
 void stopSetupAP() {
     if (!apActive) return;
-    setupServer.stop();
     WiFi.softAPdisconnect(true);
     apActive = false;
     Serial.println("📴 引导 WiFi 已关闭");
+}
+
+void startLANServer() {
+    // Matter 配对后在局域网继续提供配置页
+    if (MDNS.begin("esp32c3-wake")) {
+        Serial.println("🌐 mDNS: http://esp32c3-wake.local");
+    }
+    // 路由已在 startSetupAP 注册过，直接 begin 即可；
+    // 若出厂重置后直接进入已配对状态，需重新注册
+    if (!apActive) {
+        registerWebRoutes();
+        setupServer.begin();
+    }
+    Serial.println("🌐 配置页: http://" + WiFi.localIP().toString());
 }
 
 // =====================================================
@@ -372,8 +440,7 @@ void setup() {
     } else {
         current_status = STATUS_CONNECTED;
         Serial.println("✅ Matter 已配对，设备正常运行");
-        Serial.println("   在米家 App 中即可控制\n");
-        // Matter 配对后 BLE 已由 Matter 释放，可安全初始化唤醒 BLE
+        startLANServer();
         initWakeupBLE();
     }
 
@@ -382,7 +449,7 @@ void setup() {
 
 void loop() {
     esp_task_wdt_reset();
-    if (apActive) setupServer.handleClient();
+    setupServer.handleClient();
     checkButton();
     updateStatusLED();
     handleBLEAdvertising();
@@ -406,6 +473,7 @@ void loop() {
         Serial.println("🎉 Matter 配对成功！设备已加入米家");
         stopSetupAP();
         delay(1000); // 等待 Matter BLE 栈完全释放
+        startLANServer();
         initWakeupBLE();
     }
     prevCommissioned = nowCommissioned;

@@ -1,0 +1,8 @@
+# ESP32-C3 分区表 (4MB Flash) - Matter 版
+# Matter 需要独立的 matter_kvs NVS 分区存储配对凭据
+#
+# Name,      Type, SubType,  Offset,   Size,    Flags
+nvs,         data, nvs,      0x9000,   0x5000,
+otadata,     data, ota,      0xe000,   0x2000,
+app0,        app,  ota_0,    0x10000,  0x300000,
+matter_kvs,  data, nvs,      0x310000, 0xF0000,

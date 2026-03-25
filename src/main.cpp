@@ -312,7 +312,8 @@ void startBLEAdvertising() {
 
     pWakeAdv->stop();
     BLEAdvertisementData advData;
-    std::string raw(reinterpret_cast<char*>(wake_adv_data), sizeof(wake_adv_data));
+    // BLEAdvertisementData::addData 需要 Arduino String 类型
+    String raw(reinterpret_cast<char*>(wake_adv_data), sizeof(wake_adv_data));
     advData.addData(raw);
     pWakeAdv->setAdvertisementData(advData);
     pWakeAdv->start();
@@ -419,15 +420,19 @@ void setup() {
     digitalWrite(LED_PIN,        LOW);
     digitalWrite(STATUS_LED_PIN, LOW);
 
-    esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+    // IDF 5.x WDT API
+    const esp_task_wdt_config_t wdt_config = {
+        .timeout_ms    = WDT_TIMEOUT_SECONDS * 1000,
+        .idle_core_mask = 0,
+        .trigger_panic = true,
+    };
+    esp_task_wdt_init(&wdt_config);
     esp_task_wdt_add(NULL);
 
     loadConfig();
 
     // 初始化 Matter 和 On/Off Light 端点
-    // 固定 passcode/discriminator，使 QR 码每次相同
-    Matter.setPasscode(MATTER_PASSCODE);
-    Matter.setDiscriminator(MATTER_DISCRIMINATOR);
+    // arduino-esp32 3.x 的 Matter.begin() 使用库内置默认 passcode/discriminator
     Matter.begin();
     MatterLight.begin();
     MatterLight.onChangeOnOff(onLightChange);

@@ -78,6 +78,12 @@ BLEAdvertising* pWakeAdv        = nullptr;
 volatile bool pendingBLEStart = false;
 volatile bool pendingBLEStop  = false;
 
+// ==================== Matter 配对参数（固定值 → 可预先生成 QR 码贴到设备上）====================
+// passcode: 8位数字，不能是 00000000/11111111 等连号；discriminator: 0-4095
+// 修改这两个值后，用 Matter.getOnboardingQRCodeUrl() 重新生成 QR 码
+#define MATTER_PASSCODE     20202021
+#define MATTER_DISCRIMINATOR 3840
+
 // ==================== 对象 ====================
 Preferences      prefs;
 MatterOnOffLight MatterLight;
@@ -283,6 +289,9 @@ void setup() {
     loadConfig();
 
     // 初始化 Matter 和 On/Off Light 端点
+    // 固定 passcode/discriminator，使 QR 码每次相同
+    Matter.setPasscode(MATTER_PASSCODE);
+    Matter.setDiscriminator(MATTER_DISCRIMINATOR);
     Matter.begin();
     MatterLight.begin();
     MatterLight.onChangeOnOff(onLightChange);

@@ -1,35 +1,36 @@
 /**
- * Matter + BLE 唤醒小爱音箱 (ESP32-C3)
- * 版本: 4.1 - 接入米家 Matter 协议
+ * BLE 唤醒小爱音箱 (ESP32-C3)
+ * 版本: 5.0 - 巴法云 MQTT 方案（无需 Matter 认证）
  *
- * 配网流程（首次使用）：
- *   1. 上电后 LED 快闪，设备自动开启配对引导 WiFi
- *   2. 手机连接 WiFi "ESP32_Matter_Setup"（密码见 SETUP_AP_PASSWORD）
- *   3. 浏览器访问 192.168.4.1，查看 Matter 配对码 / 二维码链接
- *   4. 断开引导 WiFi，打开米家 App → 添加设备 → 扫码 / 手动输入配对码
- *   5. Matter 自动完成 WiFi 配置，配对成功后引导 WiFi 自动关闭
- *   6. 配对成功后 LED 慢闪，设备出现在米家 App
+ * 首次配置流程：
+ *   1. 上电后 LED 快闪，设备开启配置热点 "ESP32_BLE_Wake"（密码 12345678）
+ *   2. 手机连接热点 → 浏览器访问 192.168.4.1
+ *   3. 填写：家庭 WiFi 账号/密码、巴法云 UID（私钥）、主题名、BLE 参数
+ *   4. 点击"保存并重启"，设备自动接入家庭 WiFi 并连接巴法云
+ *
+ * 接入米家方法：
+ *   1. 登录 bemfa.com → 控制台 → 新建主题（类型选"灯"或"开关"）
+ *   2. 在巴法云 App 或米家"巴法云"插件中授权，即可用米家/小爱控制
  *
  * 日常使用：
- *   - 米家 App / 小爱音箱发出"开"指令 → 发送 BLE 广播唤醒目标设备
- *   - 米家 App 发出"关"指令 → 停止 BLE 广播
+ *   米家"开" / 小爱"打开" → MQTT "on" → BLE 广播唤醒小爱音箱
+ *   米家"关" / 小爱"关闭" → MQTT "off" → 停止广播
  *
  * 按键操作：
- *   短按 → 未配对：重启引导 WiFi；已配对：手动触发 BLE 广播测试
- *   长按(>3s) → 出厂重置（Matter 解配对 + 清除所有配置）
+ *   短按 → 配置模式：重启热点；正常模式：手动触发 BLE 广播测试
+ *   长按(>3s) → 出厂重置，清除所有配置
  */
 
-#include <Matter.h>
-#include <MatterEndpoints/MatterOnOffLight.h>
-#include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
-#include "esp_system.h"
-#include "esp_task_wdt.h"
+#include <Preferences.h>
 #include <BLEDevice.h>
 #include <BLEAdvertising.h>
 #include <esp_mac.h>
+#include <PubSubClient.h>
+#include "esp_system.h"
+#include "esp_task_wdt.h"
 
 // ==================== 引脚定义 ====================
 #define TRIGGER_PIN    9
@@ -41,69 +42,89 @@
 #define BUTTON_DEBOUNCE_MS   50
 #define LONG_PRESS_MS        3000
 #define BLE_WAKE_DURATION_MS 1000
+#define MQTT_RECONNECT_MS    5000
+#define WIFI_TIMEOUT_MS      30000
+#define WIFI_RECONNECT_MS    15000
 
-// ==================== BLE 设备名（唤醒模式）====================
-#define BLE_DEVICE_NAME "ESP32C3_BLE_Beacon"
-
-// ==================== 配对引导 WiFi AP ====================
-#define SETUP_AP_SSID     "ESP32_Matter_Setup"
+// ==================== 配置热点 ====================
+#define SETUP_AP_SSID     "ESP32_BLE_Wake"
 #define SETUP_AP_PASSWORD "12345678"
 
-// ==================== 配置默认值 ====================
+// ==================== 巴法云 MQTT ====================
+#define BEMFA_HOST "bemfa.com"
+#define BEMFA_PORT 9501
+
+// ==================== BLE ====================
+#define BLE_DEVICE_NAME "ESP32C3_BLE_Beacon"
+
+// ==================== 默认 BLE 参数 ====================
 const char* DEFAULT_BLE_MAC  = "78:81:8c:06:9a:c4";
 const char* DEFAULT_BLE_DATA = "0201061BFF53050100037E0566200001816D60168C81780F00000000000000";
 
-// ==================== 配置缓冲区（仅 BLE 唤醒参数）====================
-// WiFi 配置由 Matter 自动管理，无需手动保存
-char ble_mac_buf[19]  = "";
-char ble_data_buf[65] = "";
+// ==================== 配置缓冲区（从 NVS 加载）====================
+char wifi_ssid[33]    = "";
+char wifi_pass[65]    = "";
+char bemfa_uid[65]    = "";   // 巴法云私钥
+char bemfa_topic[33]  = "";   // 主题名，如 "light001"
+char ble_mac[19]      = "";
+char ble_data[65]     = "";
 
-// ==================== BLE 唤醒广播数据 ====================
-// 设备基础 MAC，用于 Matter 配对时的设备识别
+// ==================== BLE 广播数据 ====================
 uint8_t baseMAC[6] = {0x78, 0x81, 0x8c, 0x06, 0x9a, 0xc4};
 
-static uint8_t wake_adv_data[] = {
+// 最大 32 字节，默认 28 字节（可由用户配置覆盖）
+static uint8_t wake_adv_raw[64] = {
     0x02, 0x01, 0x06,
     0x1B, 0xFF,
     0x53, 0x05, 0x01, 0x00, 0x03, 0x7e, 0x05, 0x66, 0x20, 0x00, 0x01, 0x81,
     0x6D, 0x60, 0x16, 0x8C, 0x81, 0x78,
     0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
+static size_t wake_adv_len = 28;
 
 // ==================== 系统状态 ====================
-enum SystemStatus { STATUS_BOOT, STATUS_COMMISSIONING, STATUS_CONNECTED };
+enum SystemStatus {
+    STATUS_BOOT,
+    STATUS_CONFIGAP,       // 等待 Web 配置
+    STATUS_WIFI_CONNECTING,// 正在连接 WiFi
+    STATUS_CONNECTED       // WiFi + MQTT 正常运行
+};
 SystemStatus current_status = STATUS_BOOT;
 
-unsigned long last_led_toggle = 0;
-bool          led_state       = false;
+unsigned long lastLedToggle = 0;
+bool          ledState      = false;
 
-// ==================== BLE 唤醒状态 ====================
-bool            bleInitialized  = false;
-unsigned long   bleAdvStart     = 0;
-BLEAdvertising* pWakeAdv        = nullptr;
+// ==================== BLE 状态 ====================
+bool            bleInitialized = false;
+unsigned long   bleAdvStart    = 0;
+BLEAdvertising* pWakeAdv       = nullptr;
 
-// ==================== Matter 回调 → loop 通信标志 ====================
-// Matter 回调运行在独立任务中，用 volatile flag 安全传递到 loop
+// ==================== 跨任务标志 ====================
 volatile bool pendingBLEStart = false;
 volatile bool pendingBLEStop  = false;
 
-// ==================== Matter 配对参数（固定值 → 可预先生成 QR 码贴到设备上）====================
-// passcode: 8位数字，不能是 00000000/11111111 等连号；discriminator: 0-4095
-// 修改这两个值后，用 Matter.getOnboardingQRCodeUrl() 重新生成 QR 码
-#define MATTER_PASSCODE     20202021
-#define MATTER_DISCRIMINATOR 3840
+// ==================== 重连计时 ====================
+unsigned long lastMqttAttempt = 0;
+unsigned long lastWifiAttempt = 0;
 
 // ==================== 对象 ====================
-Preferences      prefs;
-MatterOnOffLight MatterLight;
-WebServer        setupServer(80);
-bool             apActive = false;
+Preferences  prefs;
+WebServer    webServer(80);
+WiFiClient   wifiClient;
+PubSubClient mqtt(wifiClient);
+bool         apActive = false;
 
 // ==================== 函数声明 ====================
 void loadConfig();
-void saveConfig(const String& mac, const String& data);
-void startSetupAP();
-void stopSetupAP();
+void saveConfig(const String& ssid, const String& pass,
+                const String& uid,  const String& topic,
+                const String& mac,  const String& data);
+void startConfigAP();
+void stopConfigAP();
+void connectWiFi();
+bool mqttConnect();
+void mqttCallback(char* topic, byte* payload, unsigned int len);
+void handleMQTT();
 void initWakeupBLE();
 void startBLEAdvertising();
 void stopBLEAdvertising();
@@ -111,66 +132,52 @@ void handleBLEAdvertising();
 void checkButton();
 void updateStatusLED();
 void safeRestart(const char* reason);
+String buildConfigPage();
+void registerWebRoutes();
 
 // =====================================================
-// Matter 开关回调（运行在 Matter 任务）
-// =====================================================
-
-bool onLightChange(bool state) {
-    // 只设置 flag，不直接操作 BLE（避免跨任务竞争）
-    if (state) {
-        pendingBLEStart = true;
-    } else {
-        pendingBLEStop = true;
-    }
-    digitalWrite(STATUS_LED_PIN, state ? HIGH : LOW);
-    Serial.println(String("📨 Matter 指令: ") + (state ? "ON → 触发唤醒广播" : "OFF → 停止广播"));
-    return true;
-}
-
-// =====================================================
-// 配置加载/保存（仅 BLE 唤醒参数）
+// 配置加载 / 保存
 // =====================================================
 
 void loadConfig() {
     if (!prefs.begin("config", true)) {
-        strcpy(ble_mac_buf,  DEFAULT_BLE_MAC);
-        strcpy(ble_data_buf, DEFAULT_BLE_DATA);
         prefs.end();
+        strcpy(ble_mac,  DEFAULT_BLE_MAC);
+        strcpy(ble_data, DEFAULT_BLE_DATA);
         return;
     }
-    String mac  = prefs.getString("ble_mac",  DEFAULT_BLE_MAC);
-    String data = prefs.getString("ble_data", DEFAULT_BLE_DATA);
+    prefs.getString("wifi_ssid",    "").toCharArray(wifi_ssid,   sizeof(wifi_ssid));
+    prefs.getString("wifi_pass",    "").toCharArray(wifi_pass,   sizeof(wifi_pass));
+    prefs.getString("bemfa_uid",    "").toCharArray(bemfa_uid,   sizeof(bemfa_uid));
+    prefs.getString("bemfa_topic",  "").toCharArray(bemfa_topic, sizeof(bemfa_topic));
+    prefs.getString("ble_mac",  DEFAULT_BLE_MAC).toCharArray(ble_mac,   sizeof(ble_mac));
+    prefs.getString("ble_data", DEFAULT_BLE_DATA).toCharArray(ble_data, sizeof(ble_data));
     prefs.end();
 
-    strncpy(ble_mac_buf,  mac.c_str(),  sizeof(ble_mac_buf) - 1);
-    strncpy(ble_data_buf, data.c_str(), sizeof(ble_data_buf) - 1);
-    Serial.println("✅ 配置已加载 - BLE MAC: " + mac);
+    Serial.println("✅ 配置已加载 - WiFi: " + String(wifi_ssid)
+                   + "  Bemfa主题: " + String(bemfa_topic));
+}
+
+void saveConfig(const String& ssid, const String& pass,
+                const String& uid,  const String& topic,
+                const String& mac,  const String& data) {
+    if (!prefs.begin("config", false)) return;
+    prefs.putString("wifi_ssid",   ssid);
+    prefs.putString("wifi_pass",   pass);
+    prefs.putString("bemfa_uid",   uid);
+    prefs.putString("bemfa_topic", topic);
+    prefs.putString("ble_mac",     mac.length()  > 0 ? mac  : DEFAULT_BLE_MAC);
+    prefs.putString("ble_data",    data.length() > 0 ? data : DEFAULT_BLE_DATA);
+    prefs.end();
+    Serial.println("💾 配置已保存");
 }
 
 // =====================================================
-// Web 配置页（AP 模式 + 配对后 LAN 模式复用同一套路由）
+// Web 配置页
 // =====================================================
 
-// 从 getOnboardingQRCodeUrl() 返回的 URL 中提取 MT:... 载荷
-// URL 格式: https://project-chip.github.io/...?data=MT%3AYYYY
-static String extractQRPayload(const String& url) {
-    int idx = url.indexOf("data=");
-    if (idx < 0) return url;
-    String payload = url.substring(idx + 5);
-    payload.replace("%3A", ":");
-    payload.replace("%3a", ":");
-    // 去掉 & 后面的其他参数
-    int amp = payload.indexOf('&');
-    if (amp >= 0) payload = payload.substring(0, amp);
-    return payload;
-}
-
-// 返回完整 HTML 页面（commissioned 决定是否显示 Matter 配对区）
-String buildConfigPage(bool commissioned) {
-    String code    = commissioned ? "" : Matter.getManualPairingCode();
-    String qrPayload = commissioned ? "" : extractQRPayload(Matter.getOnboardingQRCodeUrl());
-    String ip      = commissioned ? WiFi.localIP().toString() : "192.168.4.1";
+String buildConfigPage() {
+    bool configured = (strlen(wifi_ssid) > 0 && strlen(bemfa_uid) > 0);
 
     String html =
         "<!DOCTYPE html><html><head>"
@@ -178,143 +185,250 @@ String buildConfigPage(bool commissioned) {
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<style>"
         "body{font-family:sans-serif;padding:20px;max-width:460px;margin:auto;color:#333}"
-        "h2{margin-bottom:2px} .sub{color:#888;font-size:.9em;margin:0 0 16px}"
-        ".code{font-size:1.8em;font-weight:bold;color:#e74c3c;letter-spacing:3px;"
-        "background:#fff5f5;padding:10px;border-radius:8px;text-align:center;margin:12px 0}"
-        "#qrbox{text-align:center;margin:14px 0}"
+        "h2{margin-bottom:4px}"
+        "h3{margin:0 0 6px;font-size:1em;color:#555}"
+        ".sub{color:#888;font-size:.9em;margin:0 0 16px}"
         "label{display:block;margin-top:14px;font-weight:bold;font-size:.9em}"
-        "input[type=text]{width:100%;box-sizing:border-box;padding:9px;border:1px solid #ddd;"
-        "border-radius:6px;font-size:.95em;margin-top:4px}"
-        "input[type=submit]{width:100%;background:#1989fa;color:#fff;border:none;padding:12px;"
-        "border-radius:8px;font-size:1em;margin-top:16px;cursor:pointer}"
+        "input[type=text],input[type=password]{"
+        "  width:100%;box-sizing:border-box;padding:9px;"
+        "  border:1px solid #ddd;border-radius:6px;font-size:.95em;margin-top:4px}"
+        "input[type=submit]{width:100%;background:#1989fa;color:#fff;border:none;"
+        "  padding:12px;border-radius:8px;font-size:1em;margin-top:20px;cursor:pointer}"
         "hr{border:none;border-top:1px solid #eee;margin:20px 0}"
-        ".ok{color:#07c160;font-weight:bold}"
-        "</style></head><body>";
+        ".tip{font-size:.82em;color:#aaa;margin-top:5px;line-height:1.5}"
+        ".status{background:#f0f9eb;border:1px solid #b3e19d;border-radius:8px;"
+        "  padding:10px 14px;margin-bottom:16px;font-size:.9em;color:#333}"
+        "</style></head><body>"
+        "<h2>BLE 唤醒配置</h2>";
 
-    // ---- Matter 配对区（仅未配对时显示）----
-    if (!commissioned) {
-        // jsDelivr CDN 在国内可访问；qrcode.js 客户端生成二维码，无需外部网站
-        html += "<h2>Matter 配对</h2>"
-                "<p class='sub'>用米家 App 扫描下方二维码完成配对</p>"
-                "<div id='qrbox'><canvas id='qr'></canvas></div>"
-                "<p style='margin-bottom:4px'>手动配对码（扫码失败时输入）：</p>"
-                "<div class='code'>" + code + "</div>"
-                "<script src='https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js'></script>"
-                "<script>"
-                "QRCode.toCanvas(document.getElementById('qr'),'" + qrPayload + "',"
-                "{width:220,margin:2},function(e){if(e){document.getElementById('qrbox').innerText='二维码载荷: " + qrPayload + "';}})"
-                "</script>"
-                "<hr>";
+    if (configured) {
+        html += "<div class='status'>"
+                "设备已配置<br>"
+                "WiFi: <b>" + String(wifi_ssid) + "</b> &nbsp; "
+                "巴法云主题: <b>" + String(bemfa_topic) + "</b>"
+                "</div>";
     } else {
-        html += "<h2>BLE 唤醒配置</h2>"
-                "<p class='sub'>设备已接入米家，可随时修改唤醒目标</p>";
+        html += "<p class='sub'>首次使用，请填写所有参数后保存重启</p>";
     }
 
-    // ---- BLE 配置表单 ----
-    html += "<form method='POST' action='/save'>"
-            "<label>目标设备 BLE MAC</label>"
-            "<input type='text' name='mac' value='" + String(ble_mac_buf) + "' "
-            "placeholder='78:81:8c:06:9a:c4' pattern='^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$' required>"
-            "<label>BLE 广播数据（HEX，不含空格）</label>"
-            "<input type='text' name='data' value='" + String(ble_data_buf) + "' "
-            "placeholder='0201061BFF...' pattern='^[0-9a-fA-F]+$' required>"
-            "<input type='submit' value='保存并重启'>"
-            "</form>";
+    html +=
+        "<form method='POST' action='/save'>"
 
-    if (!commissioned) {
-        html += "<hr><p style='font-size:.85em;color:#aaa'>"
-                "配对成功后可通过 <b>http://" + ip + "</b> 或 "
-                "<b>http://esp32c3-wake.local</b> 继续访问此页面</p>";
-    }
+        // WiFi
+        "<hr><h3>WiFi 设置</h3>"
+        "<label>WiFi 名称 (SSID)</label>"
+        "<input type='text' name='ssid' value='" + String(wifi_ssid) + "' required "
+        "placeholder='家庭 WiFi 名称（仅支持 2.4GHz）'>"
+        "<label>WiFi 密码</label>"
+        "<input type='password' name='pass' value='" + String(wifi_pass) + "' "
+        "placeholder='WiFi 密码（无密码留空）'>"
 
-    html += "</body></html>";
+        // 巴法云
+        "<hr><h3>巴法云 MQTT 设置</h3>"
+        "<p class='tip'>"
+        "1. 前往 <b>bemfa.com</b> 注册并登录<br>"
+        "2. 个人中心 → 复制 <b>私钥（UID）</b><br>"
+        "3. 控制台 → 新建主题（类型选\"灯\"或\"开关\"），记下主题名<br>"
+        "4. 在巴法云 App 内接入米家，即可用米家/小爱控制"
+        "</p>"
+        "<label>巴法云私钥（UID）</label>"
+        "<input type='text' name='uid' value='" + String(bemfa_uid) + "' required "
+        "placeholder='请输入巴法云账号私钥'>"
+        "<label>主题名称</label>"
+        "<input type='text' name='topic' value='" + String(bemfa_topic) + "' required "
+        "placeholder='例如 light001'>"
+
+        // BLE
+        "<hr><h3>BLE 唤醒目标（可选）</h3>"
+        "<p class='tip'>留空使用默认值；如需唤醒特定音箱，填写其 BLE MAC 和广播数据</p>"
+        "<label>目标设备 BLE MAC</label>"
+        "<input type='text' name='mac' value='" + String(ble_mac) + "' "
+        "placeholder='78:81:8c:06:9a:c4' "
+        "pattern='^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'>"
+        "<label>BLE 广播数据（HEX，不含空格）</label>"
+        "<input type='text' name='data' value='" + String(ble_data) + "' "
+        "placeholder='0201061BFF...' pattern='^[0-9a-fA-F]*$'>"
+
+        "<input type='submit' value='保存并重启'>"
+        "</form>"
+        "</body></html>";
     return html;
 }
 
 void registerWebRoutes() {
-    setupServer.on("/", HTTP_GET, []() {
-        setupServer.send(200, "text/html; charset=utf-8",
-                         buildConfigPage(Matter.isDeviceCommissioned()));
+    webServer.on("/", HTTP_GET, []() {
+        webServer.send(200, "text/html; charset=utf-8", buildConfigPage());
     });
 
-    setupServer.on("/save", HTTP_POST, []() {
-        String mac  = setupServer.arg("mac");
-        String data = setupServer.arg("data");
+    webServer.on("/save", HTTP_POST, []() {
+        String ssid  = webServer.arg("ssid");
+        String pass  = webServer.arg("pass");
+        String uid   = webServer.arg("uid");
+        String topic = webServer.arg("topic");
+        String mac   = webServer.arg("mac");
+        String data  = webServer.arg("data");
 
-        if (mac.length() > 0 && data.length() > 0) {
-            if (prefs.begin("config", false)) {
-                prefs.putString("ble_mac",  mac);
-                prefs.putString("ble_data", data);
-                prefs.end();
-            }
-            setupServer.send(200, "text/html; charset=utf-8",
-                "<meta charset='UTF-8'>"
-                "<p style='font-family:sans-serif;padding:20px'>"
-                "✅ 已保存，设备重启中...</p>");
-            delay(800);
-            ESP.restart();
-        } else {
-            setupServer.send(400, "text/plain", "参数缺失");
+        if (ssid.length() == 0 || uid.length() == 0 || topic.length() == 0) {
+            webServer.send(400, "text/html; charset=utf-8",
+                "<meta charset='UTF-8'><p style='font-family:sans-serif;padding:20px'>"
+                "❌ WiFi 名称、巴法云私钥和主题名为必填项</p>");
+            return;
         }
+        saveConfig(ssid, pass, uid, topic, mac, data);
+        webServer.send(200, "text/html; charset=utf-8",
+            "<meta charset='UTF-8'>"
+            "<p style='font-family:sans-serif;padding:20px'>✅ 已保存，设备重启中...</p>");
+        delay(800);
+        ESP.restart();
     });
 }
 
-void startSetupAP() {
+void startConfigAP() {
     if (apActive) return;
+    WiFi.mode(WIFI_AP);
     WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD);
     registerWebRoutes();
-    setupServer.begin();
+    webServer.begin();
     apActive = true;
-    Serial.println("📶 引导 WiFi: " + String(SETUP_AP_SSID)
+    current_status = STATUS_CONFIGAP;
+    Serial.println("📶 配置热点已开启: " + String(SETUP_AP_SSID)
                    + "  密码: " + String(SETUP_AP_PASSWORD));
     Serial.println("   浏览器访问: http://192.168.4.1");
 }
 
-void stopSetupAP() {
+void stopConfigAP() {
     if (!apActive) return;
     WiFi.softAPdisconnect(true);
     apActive = false;
-    Serial.println("📴 引导 WiFi 已关闭");
-}
-
-void startLANServer() {
-    // Matter 配对后在局域网继续提供配置页
-    if (MDNS.begin("esp32c3-wake")) {
-        Serial.println("🌐 mDNS: http://esp32c3-wake.local");
-    }
-    // 路由已在 startSetupAP 注册过，直接 begin 即可；
-    // 若出厂重置后直接进入已配对状态，需重新注册
-    if (!apActive) {
-        registerWebRoutes();
-        setupServer.begin();
-    }
-    Serial.println("🌐 配置页: http://" + WiFi.localIP().toString());
+    Serial.println("📴 配置热点已关闭");
 }
 
 // =====================================================
-// 唤醒 BLE 初始化（Matter 配对完成后调用）
+// WiFi 连接
+// =====================================================
+
+void connectWiFi() {
+    if (strlen(wifi_ssid) == 0) {
+        Serial.println("⚠️ 无 WiFi 配置，启动配置热点");
+        startConfigAP();
+        return;
+    }
+
+    current_status = STATUS_WIFI_CONNECTING;
+    Serial.print("📶 连接 WiFi: " + String(wifi_ssid) + " ");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifi_ssid, wifi_pass);
+
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - start > WIFI_TIMEOUT_MS) {
+            Serial.println("\n❌ WiFi 连接超时，启动配置热点");
+            WiFi.disconnect();
+            startConfigAP();
+            return;
+        }
+        delay(500);
+        esp_task_wdt_reset();
+        Serial.print(".");
+    }
+    Serial.println("\n✅ WiFi 已连接: " + WiFi.localIP().toString());
+    current_status = STATUS_CONNECTED;
+}
+
+// =====================================================
+// MQTT（巴法云）
+// =====================================================
+
+void mqttCallback(char* topicStr, byte* payload, unsigned int len) {
+    String msg;
+    for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
+    msg.trim();
+    msg.toLowerCase();
+
+    Serial.println("📨 MQTT [" + String(topicStr) + "]: " + msg);
+
+    if (msg == "on" || msg == "1") {
+        pendingBLEStart = true;
+        digitalWrite(STATUS_LED_PIN, HIGH);
+    } else if (msg == "off" || msg == "0") {
+        pendingBLEStop = true;
+        digitalWrite(STATUS_LED_PIN, LOW);
+    }
+}
+
+bool mqttConnect() {
+    if (strlen(bemfa_uid) == 0 || strlen(bemfa_topic) == 0) return false;
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    mqtt.setServer(BEMFA_HOST, BEMFA_PORT);
+    mqtt.setCallback(mqttCallback);
+    mqtt.setKeepAlive(60);
+
+    Serial.print("🔗 连接巴法云 MQTT...");
+    // 巴法云：ClientID = 私钥，无需用户名/密码
+    if (mqtt.connect(bemfa_uid)) {
+        mqtt.subscribe(bemfa_topic);
+        Serial.println(" ✅ 已连接，订阅: " + String(bemfa_topic));
+        return true;
+    }
+    Serial.println(" ❌ 失败 (state=" + String(mqtt.state()) + ")");
+    return false;
+}
+
+void handleMQTT() {
+    if (WiFi.status() != WL_CONNECTED) {
+        // WiFi 断线，定期重连
+        if (millis() - lastWifiAttempt > WIFI_RECONNECT_MS) {
+            lastWifiAttempt = millis();
+            Serial.println("📶 WiFi 断线，尝试重连...");
+            WiFi.reconnect();
+        }
+        return;
+    }
+
+    if (!mqtt.connected()) {
+        if (millis() - lastMqttAttempt > MQTT_RECONNECT_MS) {
+            lastMqttAttempt = millis();
+            mqttConnect();
+        }
+    } else {
+        mqtt.loop();
+    }
+}
+
+// =====================================================
+// BLE 唤醒
 // =====================================================
 
 void initWakeupBLE() {
     if (bleInitialized) return;
 
-    // 根据配置设置 BLE MAC（BLE MAC = 基础MAC - 2）
+    // 解析目标 MAC，BLE MAC = 目标MAC - 2
     uint8_t mac[6];
-    if (strlen(ble_mac_buf) > 0) {
-        sscanf(ble_mac_buf, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+    if (strlen(ble_mac) > 0) {
+        sscanf(ble_mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
                &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
-        mac[5] -= 2;
     } else {
         memcpy(mac, baseMAC, 6);
-        mac[5] -= 2;
     }
+    mac[5] -= 2;
     esp_base_mac_addr_set(mac);
 
-    uint8_t readback[6];
-    esp_read_mac(readback, ESP_MAC_BT);
+    uint8_t rb[6];
+    esp_read_mac(rb, ESP_MAC_BT);
     Serial.printf("🔵 唤醒 BLE MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                  readback[0], readback[1], readback[2],
-                  readback[3], readback[4], readback[5]);
+                  rb[0], rb[1], rb[2], rb[3], rb[4], rb[5]);
+
+    // 解析 HEX 字符串广播数据
+    size_t hexLen = strlen(ble_data);
+    if (hexLen > 0 && hexLen % 2 == 0) {
+        size_t len = hexLen / 2;
+        if (len > sizeof(wake_adv_raw)) len = sizeof(wake_adv_raw);
+        for (size_t i = 0; i < len; i++) {
+            sscanf(ble_data + i * 2, "%2hhx", &wake_adv_raw[i]);
+        }
+        wake_adv_len = len;
+    }
 
     BLEDevice::init(BLE_DEVICE_NAME);
     pWakeAdv = BLEDevice::getAdvertising();
@@ -328,16 +442,14 @@ void initWakeupBLE() {
 
 void startBLEAdvertising() {
     if (!bleInitialized) initWakeupBLE();
-
     pWakeAdv->stop();
     BLEAdvertisementData advData;
-    // BLEAdvertisementData::addData 需要 Arduino String 类型
-    String raw(reinterpret_cast<char*>(wake_adv_data), sizeof(wake_adv_data));
+    String raw(reinterpret_cast<char*>(wake_adv_raw), wake_adv_len);
     advData.addData(raw);
     pWakeAdv->setAdvertisementData(advData);
     pWakeAdv->start();
     bleAdvStart = millis();
-    Serial.println("📡 BLE 唤醒广播已开始 (持续1秒)...");
+    Serial.println("📡 BLE 唤醒广播已开始 (1秒)...");
 }
 
 void stopBLEAdvertising() {
@@ -368,47 +480,46 @@ void safeRestart(const char* reason) {
 void updateStatusLED() {
     unsigned long interval;
     switch (current_status) {
-        case STATUS_COMMISSIONING: interval = 300;  break; // 快闪 - 等待米家配对
-        case STATUS_CONNECTED:     interval = 2000; break; // 慢闪 - 正常运行
-        default:                   interval = 1000; break;
+        case STATUS_CONFIGAP:        interval = 300;  break; // 快闪 - 等待配置
+        case STATUS_WIFI_CONNECTING: interval = 500;  break; // 中闪 - 连接中
+        case STATUS_CONNECTED:       interval = 2000; break; // 慢闪 - 正常运行
+        default:                     interval = 1000; break;
     }
-    if (millis() - last_led_toggle >= interval) {
-        led_state = !led_state;
-        digitalWrite(LED_PIN, led_state);
-        last_led_toggle = millis();
+    if (millis() - lastLedToggle >= interval) {
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState);
+        lastLedToggle = millis();
     }
 }
 
 void checkButton() {
-    static unsigned long last_press  = 0;
-    static bool          btn_pressed = false;
+    static unsigned long lastPress  = 0;
+    static bool          btnPressed = false;
 
     bool pressed = (digitalRead(TRIGGER_PIN) == LOW);
 
-    if (pressed && !btn_pressed) {
-        if (millis() - last_press > BUTTON_DEBOUNCE_MS) {
-            btn_pressed = true;
-            last_press  = millis();
+    if (pressed && !btnPressed) {
+        if (millis() - lastPress > BUTTON_DEBOUNCE_MS) {
+            btnPressed = true;
+            lastPress  = millis();
         }
-    } else if (!pressed && btn_pressed) {
-        unsigned long duration = millis() - last_press;
-        btn_pressed = false;
+    } else if (!pressed && btnPressed) {
+        unsigned long duration = millis() - lastPress;
+        btnPressed = false;
 
         if (duration > LONG_PRESS_MS) {
-            // 长按：Matter 出厂重置
-            Serial.println("🔄 长按(>3s): Matter 出厂重置...");
-            Matter.decommission();
+            // 长按：清除所有配置
+            Serial.println("🔄 长按(>3s): 出厂重置，清除所有配置...");
             if (prefs.begin("config", false)) {
                 prefs.clear();
                 prefs.end();
             }
             safeRestart("出厂重置完成");
         } else {
-            // 短按：重启引导 WiFi 或 手动测试 BLE
-            if (!Matter.isDeviceCommissioned()) {
-                Serial.println("🔘 短按: 重启引导 WiFi");
-                stopSetupAP();
-                startSetupAP();
+            if (current_status == STATUS_CONFIGAP) {
+                Serial.println("🔘 短按: 重启配置热点");
+                stopConfigAP();
+                startConfigAP();
             } else {
                 Serial.println("🔘 短按: 手动触发 BLE 唤醒广播 (测试)");
                 if (bleInitialized) startBLEAdvertising();
@@ -422,15 +533,14 @@ void checkButton() {
 // =====================================================
 
 void setup() {
-    // 在 BT/WiFi 初始化前设置基础 MAC
     esp_base_mac_addr_set(baseMAC);
 
     Serial.begin(115200);
     delay(1000);
 
     Serial.println("\n========================================");
-    Serial.println("  ESP32C3  Matter + BLE 唤醒小爱音箱");
-    Serial.println("  版本: 4.0 - 米家 Matter 协议");
+    Serial.println("  ESP32C3  BLE 唤醒小爱音箱 v5.0");
+    Serial.println("  方案: 巴法云 MQTT（无需设备认证）");
     Serial.println("========================================");
 
     pinMode(TRIGGER_PIN,    INPUT_PULLUP);
@@ -439,33 +549,35 @@ void setup() {
     digitalWrite(LED_PIN,        LOW);
     digitalWrite(STATUS_LED_PIN, LOW);
 
-    // IDF 5.x WDT API
     const esp_task_wdt_config_t wdt_config = {
-        .timeout_ms    = WDT_TIMEOUT_SECONDS * 1000,
+        .timeout_ms     = WDT_TIMEOUT_SECONDS * 1000,
         .idle_core_mask = 0,
-        .trigger_panic = true,
+        .trigger_panic  = true,
     };
     esp_task_wdt_init(&wdt_config);
     esp_task_wdt_add(NULL);
 
     loadConfig();
 
-    // 初始化 Matter 和 On/Off Light 端点
-    // arduino-esp32 3.x 的 Matter.begin() 使用库内置默认 passcode/discriminator
-    Matter.begin();
-    MatterLight.begin();
-    MatterLight.onChangeOnOff(onLightChange);
+    bool needConfig = (strlen(wifi_ssid) == 0 ||
+                       strlen(bemfa_uid) == 0 ||
+                       strlen(bemfa_topic) == 0);
 
-    if (!Matter.isDeviceCommissioned()) {
-        current_status = STATUS_COMMISSIONING;
-        startSetupAP();
-        Serial.println("  LED 快闪 = 等待配对");
-        Serial.println("  短按按钮 = 重启引导 WiFi\n");
+    if (needConfig) {
+        Serial.println("⚠️ 配置不完整，启动配置热点");
+        startConfigAP();
     } else {
-        current_status = STATUS_CONNECTED;
-        Serial.println("✅ Matter 已配对，设备正常运行");
-        startLANServer();
-        initWakeupBLE();
+        connectWiFi();
+        if (current_status == STATUS_CONNECTED) {
+            if (MDNS.begin("esp32c3-wake")) {
+                Serial.println("🌐 mDNS: http://esp32c3-wake.local");
+            }
+            registerWebRoutes();
+            webServer.begin();
+            Serial.println("🌐 配置页: http://" + WiFi.localIP().toString());
+            initWakeupBLE();
+            mqttConnect();
+        }
     }
 
     Serial.println("🚀 启动完成\n");
@@ -473,12 +585,15 @@ void setup() {
 
 void loop() {
     esp_task_wdt_reset();
-    setupServer.handleClient();
+    webServer.handleClient();
     checkButton();
     updateStatusLED();
     handleBLEAdvertising();
 
-    // 处理 Matter 回调传来的 BLE 请求（保证在 loop 任务执行，避免跨任务竞争）
+    if (current_status == STATUS_CONNECTED) {
+        handleMQTT();
+    }
+
     if (pendingBLEStart) {
         pendingBLEStart = false;
         if (bleInitialized) startBLEAdvertising();
@@ -488,19 +603,5 @@ void loop() {
         stopBLEAdvertising();
     }
 
-    // 检测 Matter 是否刚完成配对（首次配对后初始化唤醒 BLE）
-    static bool prevCommissioned = false;
-    bool nowCommissioned = Matter.isDeviceCommissioned();
-    if (!prevCommissioned && nowCommissioned) {
-        prevCommissioned = true;
-        current_status   = STATUS_CONNECTED;
-        Serial.println("🎉 Matter 配对成功！设备已加入米家");
-        stopSetupAP();
-        delay(1000); // 等待 Matter BLE 栈完全释放
-        startLANServer();
-        initWakeupBLE();
-    }
-    prevCommissioned = nowCommissioned;
-
-    delay(50);
+    delay(10);
 }

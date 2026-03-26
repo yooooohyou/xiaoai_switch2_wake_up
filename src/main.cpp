@@ -132,8 +132,10 @@ void handleBLEAdvertising();
 void checkButton();
 void updateStatusLED();
 void safeRestart(const char* reason);
-String buildConfigPage();
-void registerWebRoutes();
+String buildWiFiPage();
+String buildServicePage();
+void registerAPRoutes();
+void registerLANRoutes();
 
 // =====================================================
 // 配置加载 / 保存
@@ -158,28 +160,71 @@ void loadConfig() {
                    + "  Bemfa主题: " + String(bemfa_topic));
 }
 
-void saveConfig(const String& ssid, const String& pass,
-                const String& uid,  const String& topic,
-                const String& mac,  const String& data) {
+void saveWiFiConfig(const String& ssid, const String& pass) {
     if (!prefs.begin("config", false)) return;
-    prefs.putString("wifi_ssid",   ssid);
-    prefs.putString("wifi_pass",   pass);
+    prefs.putString("wifi_ssid", ssid);
+    prefs.putString("wifi_pass", pass);
+    prefs.end();
+    Serial.println("💾 WiFi 配置已保存");
+}
+
+void saveServiceConfig(const String& uid,  const String& topic,
+                       const String& mac,  const String& data) {
+    if (!prefs.begin("config", false)) return;
     prefs.putString("bemfa_uid",   uid);
     prefs.putString("bemfa_topic", topic);
     prefs.putString("ble_mac",     mac.length()  > 0 ? mac  : DEFAULT_BLE_MAC);
     prefs.putString("ble_data",    data.length() > 0 ? data : DEFAULT_BLE_DATA);
     prefs.end();
-    Serial.println("💾 配置已保存");
+    Serial.println("💾 服务配置已保存");
 }
 
 // =====================================================
 // Web 配置页
 // =====================================================
 
-String buildConfigPage() {
-    bool configured = (strlen(wifi_ssid) > 0 && strlen(bemfa_uid) > 0);
+// ---- AP 热点页：仅 WiFi 配置 ----
+String buildWiFiPage() {
+    return
+        "<!DOCTYPE html><html><head>"
+        "<meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<style>"
+        "body{font-family:sans-serif;padding:20px;max-width:420px;margin:auto;color:#333}"
+        "h2{margin-bottom:4px}"
+        ".sub{color:#888;font-size:.9em;margin:0 0 20px}"
+        "label{display:block;margin-top:14px;font-weight:bold;font-size:.9em}"
+        "input[type=text],input[type=password]{"
+        "  width:100%;box-sizing:border-box;padding:9px;"
+        "  border:1px solid #ddd;border-radius:6px;font-size:.95em;margin-top:4px}"
+        "input[type=submit]{width:100%;background:#1989fa;color:#fff;border:none;"
+        "  padding:12px;border-radius:8px;font-size:1em;margin-top:20px;cursor:pointer}"
+        ".tip{font-size:.82em;color:#aaa;margin-top:6px}"
+        "</style></head><body>"
+        "<h2>WiFi 配置</h2>"
+        "<p class='sub'>连接成功后，可通过局域网地址继续配置巴法云和 BLE 参数</p>"
+        "<form method='POST' action='/save-wifi'>"
+        "<label>WiFi 名称 (SSID)</label>"
+        "<input type='text' name='ssid' value='" + String(wifi_ssid) + "' required "
+        "placeholder='家庭 WiFi 名称（仅支持 2.4GHz）'>"
+        "<label>WiFi 密码</label>"
+        "<input type='password' name='pass' value='' "
+        "placeholder='WiFi 密码（无密码留空）'>"
+        "<p class='tip'>保存后设备将自动连接 WiFi，LED 由快闪变为慢闪即为成功</p>"
+        "<input type='submit' value='保存并连接'>"
+        "</form>"
+        "</body></html>";
+}
 
-    String html =
+// ---- 局域网页：巴法云 + BLE 配置 ----
+String buildServicePage() {
+    bool mqttOk = (strlen(bemfa_uid) > 0 && strlen(bemfa_topic) > 0);
+
+    String statusBar = mqttOk
+        ? "<div class='ok'>巴法云已配置 &nbsp; 主题: <b>" + String(bemfa_topic) + "</b></div>"
+        : "<div class='warn'>巴法云尚未配置，设备暂无法接收米家指令</div>";
+
+    return
         "<!DOCTYPE html><html><head>"
         "<meta charset='UTF-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -187,49 +232,27 @@ String buildConfigPage() {
         "body{font-family:sans-serif;padding:20px;max-width:460px;margin:auto;color:#333}"
         "h2{margin-bottom:4px}"
         "h3{margin:0 0 6px;font-size:1em;color:#555}"
-        ".sub{color:#888;font-size:.9em;margin:0 0 16px}"
         "label{display:block;margin-top:14px;font-weight:bold;font-size:.9em}"
-        "input[type=text],input[type=password]{"
+        "input[type=text]{"
         "  width:100%;box-sizing:border-box;padding:9px;"
         "  border:1px solid #ddd;border-radius:6px;font-size:.95em;margin-top:4px}"
         "input[type=submit]{width:100%;background:#1989fa;color:#fff;border:none;"
         "  padding:12px;border-radius:8px;font-size:1em;margin-top:20px;cursor:pointer}"
         "hr{border:none;border-top:1px solid #eee;margin:20px 0}"
         ".tip{font-size:.82em;color:#aaa;margin-top:5px;line-height:1.5}"
-        ".status{background:#f0f9eb;border:1px solid #b3e19d;border-radius:8px;"
-        "  padding:10px 14px;margin-bottom:16px;font-size:.9em;color:#333}"
+        ".ok{background:#f0f9eb;border:1px solid #b3e19d;border-radius:8px;"
+        "  padding:10px 14px;margin-bottom:16px;font-size:.9em}"
+        ".warn{background:#fff7e6;border:1px solid #ffd591;border-radius:8px;"
+        "  padding:10px 14px;margin-bottom:16px;font-size:.9em;color:#874d00}"
         "</style></head><body>"
-        "<h2>BLE 唤醒配置</h2>";
-
-    if (configured) {
-        html += "<div class='status'>"
-                "设备已配置<br>"
-                "WiFi: <b>" + String(wifi_ssid) + "</b> &nbsp; "
-                "巴法云主题: <b>" + String(bemfa_topic) + "</b>"
-                "</div>";
-    } else {
-        html += "<p class='sub'>首次使用，请填写所有参数后保存重启</p>";
-    }
-
-    html +=
+        "<h2>BLE 唤醒配置</h2>"
+        + statusBar +
         "<form method='POST' action='/save'>"
 
-        // WiFi
-        "<hr><h3>WiFi 设置</h3>"
-        "<label>WiFi 名称 (SSID)</label>"
-        "<input type='text' name='ssid' value='" + String(wifi_ssid) + "' required "
-        "placeholder='家庭 WiFi 名称（仅支持 2.4GHz）'>"
-        "<label>WiFi 密码</label>"
-        "<input type='password' name='pass' value='" + String(wifi_pass) + "' "
-        "placeholder='WiFi 密码（无密码留空）'>"
-
-        // 巴法云
-        "<hr><h3>巴法云 MQTT 设置</h3>"
+        "<hr><h3>巴法云 MQTT</h3>"
         "<p class='tip'>"
-        "1. 前往 <b>bemfa.com</b> 注册并登录<br>"
-        "2. 个人中心 → 复制 <b>私钥（UID）</b><br>"
-        "3. 控制台 → 新建主题（类型选\"灯\"或\"开关\"），记下主题名<br>"
-        "4. 在巴法云 App 内接入米家，即可用米家/小爱控制"
+        "登录 <b>bemfa.com</b> → 个人中心复制私钥；控制台新建主题（类型选灯/开关）<br>"
+        "在巴法云 App 内接入米家，即可用米家/小爱控制本设备"
         "</p>"
         "<label>巴法云私钥（UID）</label>"
         "<input type='text' name='uid' value='" + String(bemfa_uid) + "' required "
@@ -238,8 +261,7 @@ String buildConfigPage() {
         "<input type='text' name='topic' value='" + String(bemfa_topic) + "' required "
         "placeholder='例如 light001'>"
 
-        // BLE
-        "<hr><h3>BLE 唤醒目标（可选）</h3>"
+        "<hr><h3>BLE 唤醒目标</h3>"
         "<p class='tip'>留空使用默认值；如需唤醒特定音箱，填写其 BLE MAC 和广播数据</p>"
         "<label>目标设备 BLE MAC</label>"
         "<input type='text' name='mac' value='" + String(ble_mac) + "' "
@@ -252,29 +274,54 @@ String buildConfigPage() {
         "<input type='submit' value='保存并重启'>"
         "</form>"
         "</body></html>";
-    return html;
 }
 
-void registerWebRoutes() {
+void registerAPRoutes() {
+    // AP 模式：仅 WiFi 配置
     webServer.on("/", HTTP_GET, []() {
-        webServer.send(200, "text/html; charset=utf-8", buildConfigPage());
+        webServer.send(200, "text/html; charset=utf-8", buildWiFiPage());
+    });
+
+    webServer.on("/save-wifi", HTTP_POST, []() {
+        String ssid = webServer.arg("ssid");
+        String pass = webServer.arg("pass");
+        if (ssid.length() == 0) {
+            webServer.send(400, "text/html; charset=utf-8",
+                "<meta charset='UTF-8'>"
+                "<p style='font-family:sans-serif;padding:20px'>❌ WiFi 名称不能为空</p>");
+            return;
+        }
+        saveWiFiConfig(ssid, pass);
+        webServer.send(200, "text/html; charset=utf-8",
+            "<meta charset='UTF-8'>"
+            "<p style='font-family:sans-serif;padding:20px'>"
+            "✅ WiFi 已保存，设备重启中...<br>"
+            "<small>连接成功后请访问 <b>http://esp32c3-wake.local</b> 配置巴法云参数</small>"
+            "</p>");
+        delay(800);
+        ESP.restart();
+    });
+}
+
+void registerLANRoutes() {
+    // 局域网模式：巴法云 + BLE 配置
+    webServer.on("/", HTTP_GET, []() {
+        webServer.send(200, "text/html; charset=utf-8", buildServicePage());
     });
 
     webServer.on("/save", HTTP_POST, []() {
-        String ssid  = webServer.arg("ssid");
-        String pass  = webServer.arg("pass");
         String uid   = webServer.arg("uid");
         String topic = webServer.arg("topic");
         String mac   = webServer.arg("mac");
         String data  = webServer.arg("data");
 
-        if (ssid.length() == 0 || uid.length() == 0 || topic.length() == 0) {
+        if (uid.length() == 0 || topic.length() == 0) {
             webServer.send(400, "text/html; charset=utf-8",
-                "<meta charset='UTF-8'><p style='font-family:sans-serif;padding:20px'>"
-                "❌ WiFi 名称、巴法云私钥和主题名为必填项</p>");
+                "<meta charset='UTF-8'>"
+                "<p style='font-family:sans-serif;padding:20px'>❌ 巴法云私钥和主题名为必填项</p>");
             return;
         }
-        saveConfig(ssid, pass, uid, topic, mac, data);
+        saveServiceConfig(uid, topic, mac, data);
         webServer.send(200, "text/html; charset=utf-8",
             "<meta charset='UTF-8'>"
             "<p style='font-family:sans-serif;padding:20px'>✅ 已保存，设备重启中...</p>");
@@ -287,13 +334,13 @@ void startConfigAP() {
     if (apActive) return;
     WiFi.mode(WIFI_AP);
     WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD);
-    registerWebRoutes();
+    registerAPRoutes();
     webServer.begin();
     apActive = true;
     current_status = STATUS_CONFIGAP;
     Serial.println("📶 配置热点已开启: " + String(SETUP_AP_SSID)
                    + "  密码: " + String(SETUP_AP_PASSWORD));
-    Serial.println("   浏览器访问: http://192.168.4.1");
+    Serial.println("   浏览器访问: http://192.168.4.1  （仅填 WiFi 账号密码）");
 }
 
 void stopConfigAP() {
@@ -308,11 +355,6 @@ void stopConfigAP() {
 // =====================================================
 
 void connectWiFi() {
-    if (strlen(wifi_ssid) == 0) {
-        Serial.println("⚠️ 无 WiFi 配置，启动配置热点");
-        startConfigAP();
-        return;
-    }
 
     current_status = STATUS_WIFI_CONNECTING;
     Serial.print("📶 连接 WiFi: " + String(wifi_ssid) + " ");
@@ -563,8 +605,8 @@ void setup() {
                        strlen(bemfa_uid) == 0 ||
                        strlen(bemfa_topic) == 0);
 
-    if (needConfig) {
-        Serial.println("⚠️ 配置不完整，启动配置热点");
+    if (strlen(wifi_ssid) == 0) {
+        Serial.println("⚠️ 无 WiFi 配置，启动配置热点");
         startConfigAP();
     } else {
         connectWiFi();
@@ -572,11 +614,16 @@ void setup() {
             if (MDNS.begin("esp32c3-wake")) {
                 Serial.println("🌐 mDNS: http://esp32c3-wake.local");
             }
-            registerWebRoutes();
+            registerLANRoutes();
             webServer.begin();
             Serial.println("🌐 配置页: http://" + WiFi.localIP().toString());
             initWakeupBLE();
-            mqttConnect();
+            // 巴法云参数齐全才连接 MQTT
+            if (strlen(bemfa_uid) > 0 && strlen(bemfa_topic) > 0) {
+                mqttConnect();
+            } else {
+                Serial.println("⚠️ 巴法云未配置，请访问配置页填写私钥和主题名");
+            }
         }
     }
 

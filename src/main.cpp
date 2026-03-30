@@ -455,7 +455,7 @@ void mqttCallback(char* topicStr, byte* payload, unsigned int len) {
     JsonObject data = doc["data"].as<JsonObject>();
 
     // 读取开关 DP（DP 名称由 tuya_dp_key 配置）
-    if (data.containsKey(tuya_dp_key)) {
+    if (data[tuya_dp_key].is<JsonObject>()) {
         bool switchOn = data[tuya_dp_key]["value"].as<bool>();
         Serial.println("📨 涂鸦指令 [" + String(tuya_dp_key) + "]: "
                        + String(switchOn ? "ON" : "OFF"));

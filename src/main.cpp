@@ -453,11 +453,39 @@ void mqttCallback(char* topicStr, byte* payload, unsigned int len) {
 
     String msgId = doc["msgId"] | "";
     JsonObject data = doc["data"].as<JsonObject>();
+    if (data.isNull()) return;
 
-    // 读取开关 DP（DP 名称由 tuya_dp_key 配置）
-    if (data[tuya_dp_key].is<JsonObject>()) {
-        bool switchOn = data[tuya_dp_key]["value"].as<bool>();
-        Serial.println("📨 涂鸦指令 [" + String(tuya_dp_key) + "]: "
+    // 从 DP 值中提取布尔值：兼容两种格式
+    //   标准物模型: {"switch_1": {"value": true}}
+    //   简单格式:   {"5346": true}
+    auto extractBool = [](JsonVariant v) -> bool {
+        if (v.is<JsonObject>()) return v["value"].as<bool>();
+        return v.as<bool>();
+    };
+
+    // 优先匹配配置的 DP 标识符，找不到时遍历所有 DP 取第一个布尔值
+    bool found = false;
+    bool switchOn = false;
+    String matchedKey = "";
+
+    if (!data[tuya_dp_key].isNull()) {
+        switchOn  = extractBool(data[tuya_dp_key]);
+        matchedKey = String(tuya_dp_key);
+        found = true;
+    } else {
+        for (JsonPair kv : data) {
+            JsonVariant v = kv.value();
+            if (v.is<bool>() || (v.is<JsonObject>() && !v["value"].isNull())) {
+                switchOn   = extractBool(v);
+                matchedKey = kv.key().c_str();
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if (found) {
+        Serial.println("📨 涂鸦指令 [" + matchedKey + "]: "
                        + String(switchOn ? "ON" : "OFF"));
         if (switchOn) {
             pendingBLEStart = true;
@@ -466,7 +494,6 @@ void mqttCallback(char* topicStr, byte* payload, unsigned int len) {
             pendingBLEStop = true;
             digitalWrite(STATUS_LED_PIN, LOW);
         }
-        // 回复云端已执行
         if (msgId.length() > 0) sendSetResponse(msgId);
     }
 }

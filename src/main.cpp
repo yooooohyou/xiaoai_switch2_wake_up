@@ -544,6 +544,21 @@ bool mqttConnect() {
                           + "/thing/property/set";
         mqtt.subscribe(subTopic.c_str());
         Serial.println(" ✅ 已连接，订阅: " + subTopic);
+
+        // 上报当前设备属性，让涂鸦云将设备标记为在线（米家同步依赖此步骤）
+        {
+            String reportTopic = "tylink/" + String(tuya_device_id)
+                                 + "/thing/property/report";
+            JsonDocument rep;
+            rep["msgId"] = String(millis());
+            rep["time"]  = (long)time(nullptr) * 1000;
+            JsonObject repData = rep["data"].to<JsonObject>();
+            repData[tuya_dp_key]["value"] = false; // 初始状态：关
+            String repPayload;
+            serializeJson(rep, repPayload);
+            mqtt.publish(reportTopic.c_str(), repPayload.c_str());
+            Serial.println("📤 已上报初始状态到涂鸦云");
+        }
         return true;
     }
     Serial.println(" ❌ 失败 (state=" + String(mqtt.state()) + ")");

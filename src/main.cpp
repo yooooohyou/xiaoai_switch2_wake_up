@@ -1,23 +1,22 @@
 /**
  * BLE 唤醒小爱音箱 (ESP32-C3)
- * 版本: 6.0 - 涂鸦(Tuya) IoT 平台 MQTT 方案（无需设备认证）
+ * 版本: 7.0 - 巴法云 MQTT 方案
  *
  * 首次配置流程：
  *   1. 上电后 LED 快闪，设备开启配置热点 "ESP32_BLE_Wake"（密码 12345678）
  *   2. 手机连接热点 → 浏览器访问 192.168.4.1，填写 WiFi 账号密码
- *   3. 设备连上 WiFi 后，访问 http://esp32c3-wake.local 填写涂鸦参数
+ *   3. 设备连上 WiFi 后，访问 http://esp32c3-wake.local 填写巴法云参数
  *
- * 涂鸦参数获取：
- *   iot.tuya.com → 产品开发 → 功能定义（确认开关 DP 名称）
- *               → 设备管理 → 设备详情 → 设备证书（Device ID + Secret）
+ * 巴法云参数获取：
+ *   cloud.bemfa.com → 私钥（UID）
+ *                  → 设备管理 → 新建主题（类型选"插座"）→ 填写主题名
  *
- * 接入涂鸦智能 App / 米家：
- *   在涂鸦 IoT 平台配置产品后，用涂鸦智能 App 即可控制；
- *   也可通过 Home Assistant Tuya 插件或 Matter Bridge 接入米家。
+ * 接入小爱音箱：
+ *   在巴法云控制台绑定设备后，通过米家 App 或小爱音箱即可语音/手动控制
  *
  * 日常使用：
- *   App"开" → MQTT set → BLE 广播唤醒小爱音箱
- *   App"关" → MQTT set → 停止广播
+ *   App/语音"打开" → MQTT on → BLE 广播唤醒小爱音箱
+ *   App/语音"关闭" → MQTT off → 停止广播
  *
  * 按键操作：
  *   短按 → 配置模式：重启热点；正常模式：手动触发 BLE 广播测试
@@ -25,7 +24,6 @@
  */
 
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
@@ -33,11 +31,8 @@
 #include <BLEAdvertising.h>
 #include <esp_mac.h>
 #include <PubSubClient.h>
-#include <ArduinoJson.h>
-#include "mbedtls/md.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
-#include "time.h"
 
 // ==================== 引脚定义 ====================
 #define TRIGGER_PIN    9
@@ -52,15 +47,14 @@
 #define MQTT_RECONNECT_MS    8000
 #define WIFI_TIMEOUT_MS      30000
 #define WIFI_RECONNECT_MS    15000
-#define NTP_TIMEOUT_S        20
 
 // ==================== 配置热点 ====================
 #define SETUP_AP_SSID     "ESP32_BLE_Wake"
 #define SETUP_AP_PASSWORD "12345678"
 
-// ==================== 涂鸦云 MQTT ====================
-#define TUYA_HOST "m1.tuyacn.com"
-#define TUYA_PORT 8883
+// ==================== 巴法云 MQTT ====================
+#define BEMFA_HOST "bemfa.com"
+#define BEMFA_PORT 9501
 
 // ==================== BLE ====================
 #define BLE_DEVICE_NAME "ESP32C3_BLE_Beacon"
@@ -70,13 +64,12 @@ const char* DEFAULT_BLE_MAC  = "78:81:8c:06:9a:c4";
 const char* DEFAULT_BLE_DATA = "0201061BFF53050100037E0566200001816D60168C81780F00000000000000";
 
 // ==================== 配置缓冲区（从 NVS 加载）====================
-char wifi_ssid[33]          = "";
-char wifi_pass[65]          = "";
-char tuya_device_id[25]     = "";   // 涂鸦设备 ID
-char tuya_device_secret[33] = "";   // 涂鸦设备密钥
-char tuya_dp_key[33]        = "switch_1"; // 开关 DP 标识符
-char ble_mac[19]            = "";
-char ble_data[65]           = "";
+char wifi_ssid[33]     = "";
+char wifi_pass[65]     = "";
+char bemfa_uid[65]     = "";   // 巴法云私钥（UID）
+char bemfa_topic[33]   = "";   // 巴法云主题名
+char ble_mac[19]       = "";
+char ble_data[65]      = "";
 
 // ==================== BLE 广播数据 ====================
 uint8_t baseMAC[6] = {0x78, 0x81, 0x8c, 0x06, 0x9a, 0xc4};
@@ -116,26 +109,22 @@ unsigned long lastMqttAttempt = 0;
 unsigned long lastWifiAttempt = 0;
 
 // ==================== 对象 ====================
-Preferences       prefs;
-WebServer         webServer(80);
-WiFiClientSecure  wifiClient;
-PubSubClient      mqtt(wifiClient);
-bool              apActive = false;
+Preferences prefs;
+WebServer   webServer(80);
+WiFiClient  wifiClient;
+PubSubClient mqtt(wifiClient);
+bool        apActive = false;
 
 // ==================== 函数声明 ====================
 void loadConfig();
 void saveWiFiConfig(const String& ssid, const String& pass);
-void saveServiceConfig(const String& deviceId, const String& secret,
-                       const String& dpKey,
+void saveServiceConfig(const String& uid, const String& topic,
                        const String& mac, const String& data);
 void startConfigAP();
 void stopConfigAP();
 void connectWiFi();
-void syncNTP();
-String hmacSha256(const char* key, const String& data);
 bool mqttConnect();
 void mqttCallback(char* topic, byte* payload, unsigned int len);
-void sendSetResponse(const String& msgId);
 void handleMQTT();
 void initWakeupBLE();
 void startBLEAdvertising();
@@ -156,22 +145,20 @@ void registerLANRoutes();
 void loadConfig() {
     if (!prefs.begin("config", true)) {
         prefs.end();
-        strcpy(ble_mac,      DEFAULT_BLE_MAC);
-        strcpy(ble_data,     DEFAULT_BLE_DATA);
-        strcpy(tuya_dp_key,  "switch_1");
+        strcpy(ble_mac,  DEFAULT_BLE_MAC);
+        strcpy(ble_data, DEFAULT_BLE_DATA);
         return;
     }
-    prefs.getString("wifi_ssid",    "").toCharArray(wifi_ssid,          sizeof(wifi_ssid));
-    prefs.getString("wifi_pass",    "").toCharArray(wifi_pass,          sizeof(wifi_pass));
-    prefs.getString("tuya_did",     "").toCharArray(tuya_device_id,     sizeof(tuya_device_id));
-    prefs.getString("tuya_secret",  "").toCharArray(tuya_device_secret, sizeof(tuya_device_secret));
-    prefs.getString("tuya_dp",   "switch_1").toCharArray(tuya_dp_key,   sizeof(tuya_dp_key));
+    prefs.getString("wifi_ssid",  "").toCharArray(wifi_ssid,   sizeof(wifi_ssid));
+    prefs.getString("wifi_pass",  "").toCharArray(wifi_pass,   sizeof(wifi_pass));
+    prefs.getString("bemfa_uid",  "").toCharArray(bemfa_uid,   sizeof(bemfa_uid));
+    prefs.getString("bemfa_topic","").toCharArray(bemfa_topic, sizeof(bemfa_topic));
     prefs.getString("ble_mac",  DEFAULT_BLE_MAC).toCharArray(ble_mac,   sizeof(ble_mac));
     prefs.getString("ble_data", DEFAULT_BLE_DATA).toCharArray(ble_data, sizeof(ble_data));
     prefs.end();
 
     Serial.println("✅ 配置已加载 - WiFi: " + String(wifi_ssid)
-                   + "  涂鸦设备ID: " + String(tuya_device_id));
+                   + "  巴法云主题: " + String(bemfa_topic));
 }
 
 void saveWiFiConfig(const String& ssid, const String& pass) {
@@ -182,15 +169,13 @@ void saveWiFiConfig(const String& ssid, const String& pass) {
     Serial.println("💾 WiFi 配置已保存");
 }
 
-void saveServiceConfig(const String& deviceId, const String& secret,
-                       const String& dpKey,
-                       const String& mac,      const String& data) {
+void saveServiceConfig(const String& uid, const String& topic,
+                       const String& mac, const String& data) {
     if (!prefs.begin("config", false)) return;
-    prefs.putString("tuya_did",    deviceId);
-    prefs.putString("tuya_secret", secret);
-    prefs.putString("tuya_dp",     dpKey.length() > 0 ? dpKey : "switch_1");
-    prefs.putString("ble_mac",     mac.length()  > 0 ? mac   : DEFAULT_BLE_MAC);
-    prefs.putString("ble_data",    data.length() > 0 ? data  : DEFAULT_BLE_DATA);
+    prefs.putString("bemfa_uid",   uid);
+    prefs.putString("bemfa_topic", topic);
+    prefs.putString("ble_mac",  mac.length()  > 0 ? mac   : DEFAULT_BLE_MAC);
+    prefs.putString("ble_data", data.length() > 0 ? data  : DEFAULT_BLE_DATA);
     prefs.end();
     Serial.println("💾 服务配置已保存");
 }
@@ -218,7 +203,7 @@ String buildWiFiPage() {
         ".tip{font-size:.82em;color:#aaa;margin-top:6px}"
         "</style></head><body>"
         "<h2>WiFi 配置</h2>"
-        "<p class='sub'>连接成功后，可通过局域网地址继续配置涂鸦云和 BLE 参数</p>"
+        "<p class='sub'>连接成功后，可通过局域网地址继续配置巴法云和 BLE 参数</p>"
         "<form method='POST' action='/save-wifi'>"
         "<label>WiFi 名称 (SSID)</label>"
         "<input type='text' name='ssid' value='" + String(wifi_ssid) + "' required "
@@ -232,13 +217,13 @@ String buildWiFiPage() {
         "</body></html>";
 }
 
-// ---- 局域网页：涂鸦云 + BLE 配置 ----
+// ---- 局域网页：巴法云 + BLE 配置 ----
 String buildServicePage() {
-    bool tuyaOk = (strlen(tuya_device_id) > 0 && strlen(tuya_device_secret) > 0);
+    bool bemfaOk = (strlen(bemfa_uid) > 0 && strlen(bemfa_topic) > 0);
 
-    String statusBar = tuyaOk
-        ? "<div class='ok'>涂鸦云已配置 &nbsp; 设备ID: <b>" + String(tuya_device_id) + "</b></div>"
-        : "<div class='warn'>涂鸦云尚未配置，设备暂无法接收控制指令</div>";
+    String statusBar = bemfaOk
+        ? "<div class='ok'>巴法云已配置 &nbsp; 主题: <b>" + String(bemfa_topic) + "</b></div>"
+        : "<div class='warn'>巴法云尚未配置，设备暂无法接收控制指令</div>";
 
     return
         "<!DOCTYPE html><html><head>"
@@ -265,20 +250,17 @@ String buildServicePage() {
         + statusBar +
         "<form method='POST' action='/save'>"
 
-        "<hr><h3>涂鸦云 IoT</h3>"
+        "<hr><h3>巴法云 MQTT</h3>"
         "<p class='tip'>"
-        "iot.tuya.com → 产品开发 → 设备管理 → 设备详情 → <b>设备证书</b><br>"
-        "功能定义页确认开关的 <b>标识符</b>（通常为 switch_1）"
+        "登录 <b>cloud.bemfa.com</b> → 右上角头像 → 私钥（复制整串）<br>"
+        "设备管理 → 新建主题 → 类型选<b>插座</b> → 填写主题名（字母+数字）"
         "</p>"
-        "<label>设备 ID（Device ID）</label>"
-        "<input type='text' name='did' value='" + String(tuya_device_id) + "' required "
-        "placeholder='iotXXXXXXXXXXXXXXXXX'>"
-        "<label>设备密钥（Device Secret）</label>"
-        "<input type='text' name='secret' value='" + String(tuya_device_secret) + "' required "
-        "placeholder='XXXXXXXXXXXXXXXX'>"
-        "<label>开关 DP 标识符</label>"
-        "<input type='text' name='dp' value='" + String(tuya_dp_key) + "' required "
-        "placeholder='switch_1'>"
+        "<label>私钥（UID）</label>"
+        "<input type='text' name='uid' value='" + String(bemfa_uid) + "' required "
+        "placeholder='巴法云控制台右上角私钥'>"
+        "<label>主题名</label>"
+        "<input type='text' name='topic' value='" + String(bemfa_topic) + "' required "
+        "placeholder='例如: switch001'>"
 
         "<hr><h3>BLE 唤醒目标</h3>"
         "<p class='tip'>留空使用默认值；如需唤醒特定音箱，填写其 BLE MAC 和广播数据</p>"
@@ -314,7 +296,7 @@ void registerAPRoutes() {
             "<meta charset='UTF-8'>"
             "<p style='font-family:sans-serif;padding:20px'>"
             "✅ WiFi 已保存，设备重启中...<br>"
-            "<small>连接成功后请访问 <b>http://esp32c3-wake.local</b> 配置涂鸦云参数</small>"
+            "<small>连接成功后请访问 <b>http://esp32c3-wake.local</b> 配置巴法云参数</small>"
             "</p>");
         delay(800);
         ESP.restart();
@@ -327,19 +309,18 @@ void registerLANRoutes() {
     });
 
     webServer.on("/save", HTTP_POST, []() {
-        String did    = webServer.arg("did");
-        String secret = webServer.arg("secret");
-        String dp     = webServer.arg("dp");
-        String mac    = webServer.arg("mac");
-        String data   = webServer.arg("data");
+        String uid   = webServer.arg("uid");
+        String topic = webServer.arg("topic");
+        String mac   = webServer.arg("mac");
+        String data  = webServer.arg("data");
 
-        if (did.length() == 0 || secret.length() == 0) {
+        if (uid.length() == 0 || topic.length() == 0) {
             webServer.send(400, "text/html; charset=utf-8",
                 "<meta charset='UTF-8'>"
-                "<p style='font-family:sans-serif;padding:20px'>❌ 设备 ID 和设备密钥为必填项</p>");
+                "<p style='font-family:sans-serif;padding:20px'>❌ 私钥和主题名为必填项</p>");
             return;
         }
-        saveServiceConfig(did, secret, dp, mac, data);
+        saveServiceConfig(uid, topic, mac, data);
         webServer.send(200, "text/html; charset=utf-8",
             "<meta charset='UTF-8'>"
             "<p style='font-family:sans-serif;padding:20px'>✅ 已保存，设备重启中...</p>");
@@ -395,170 +376,42 @@ void connectWiFi() {
 }
 
 // =====================================================
-// NTP 时间同步（涂鸦 HMAC 签名需要时间戳）
-// =====================================================
-
-void syncNTP() {
-    configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org");
-    Serial.print("🕐 同步 NTP 时间");
-    time_t now = 0;
-    int retry = 0;
-    while (now < 1000000000L && retry < NTP_TIMEOUT_S * 2) {
-        delay(500);
-        esp_task_wdt_reset();
-        Serial.print(".");
-        time(&now);
-        retry++;
-    }
-    if (now > 1000000000L) {
-        Serial.println(" ✅ 时间戳: " + String((long)now));
-    } else {
-        Serial.println(" ⚠️ 同步超时，MQTT 可能无法连接");
-    }
-}
-
-// =====================================================
-// HMAC-SHA256（涂鸦签名认证）
-// =====================================================
-
-String hmacSha256(const char* key, const String& data) {
-    uint8_t hmac[32];
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
-    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
-    mbedtls_md_hmac_starts(&ctx, (const uint8_t*)key, strlen(key));
-    mbedtls_md_hmac_update(&ctx, (const uint8_t*)data.c_str(), data.length());
-    mbedtls_md_hmac_finish(&ctx, hmac);
-    mbedtls_md_free(&ctx);
-
-    String result = "";
-    for (int i = 0; i < 32; i++) {
-        if (hmac[i] < 0x10) result += "0";
-        result += String(hmac[i], HEX);
-    }
-    return result;
-}
-
-// =====================================================
-// MQTT（涂鸦云）
+// MQTT（巴法云）
 // =====================================================
 
 void mqttCallback(char* topicStr, byte* payload, unsigned int len) {
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, payload, len);
-    if (err) {
-        Serial.println("⚠️ JSON 解析失败: " + String(err.c_str()));
-        return;
+    String msg = "";
+    for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
+    msg.toLowerCase();
+    msg.trim();
+
+    Serial.println("📨 巴法云消息 [" + String(topicStr) + "]: " + msg);
+
+    if (msg == "on" || msg == "1") {
+        pendingBLEStart = true;
+        digitalWrite(STATUS_LED_PIN, HIGH);
+        Serial.println("→ 触发 BLE 唤醒广播");
+    } else if (msg == "off" || msg == "0") {
+        pendingBLEStop = true;
+        digitalWrite(STATUS_LED_PIN, LOW);
+        Serial.println("→ 停止 BLE 广播");
     }
-
-    String msgId = doc["msgId"] | "";
-    JsonObject data = doc["data"].as<JsonObject>();
-    if (data.isNull()) return;
-
-    // 从 DP 值中提取布尔值：兼容两种格式
-    //   标准物模型: {"switch_1": {"value": true}}
-    //   简单格式:   {"5346": true}
-    auto extractBool = [](JsonVariant v) -> bool {
-        if (v.is<JsonObject>()) return v["value"].as<bool>();
-        return v.as<bool>();
-    };
-
-    // 优先匹配配置的 DP 标识符，找不到时遍历所有 DP 取第一个布尔值
-    bool found = false;
-    bool switchOn = false;
-    String matchedKey = "";
-
-    if (!data[tuya_dp_key].isNull()) {
-        switchOn  = extractBool(data[tuya_dp_key]);
-        matchedKey = String(tuya_dp_key);
-        found = true;
-    } else {
-        for (JsonPair kv : data) {
-            JsonVariant v = kv.value();
-            if (v.is<bool>() || (v.is<JsonObject>() && !v["value"].isNull())) {
-                switchOn   = extractBool(v);
-                matchedKey = kv.key().c_str();
-                found = true;
-                break;
-            }
-        }
-    }
-
-    if (found) {
-        Serial.println("📨 涂鸦指令 [" + matchedKey + "]: "
-                       + String(switchOn ? "ON" : "OFF"));
-        if (switchOn) {
-            pendingBLEStart = true;
-            digitalWrite(STATUS_LED_PIN, HIGH);
-        } else {
-            pendingBLEStop = true;
-            digitalWrite(STATUS_LED_PIN, LOW);
-        }
-        if (msgId.length() > 0) sendSetResponse(msgId);
-    }
-}
-
-void sendSetResponse(const String& msgId) {
-    String topic = "tylink/" + String(tuya_device_id)
-                   + "/thing/property/set_response";
-    JsonDocument doc;
-    doc["msgId"] = msgId;
-    doc["time"]  = (long)time(nullptr) * 1000;
-    doc["code"]  = 0;
-    String payload;
-    serializeJson(doc, payload);
-    mqtt.publish(topic.c_str(), payload.c_str());
 }
 
 bool mqttConnect() {
-    if (strlen(tuya_device_id) == 0 || strlen(tuya_device_secret) == 0) return false;
+    if (strlen(bemfa_uid) == 0 || strlen(bemfa_topic) == 0) return false;
     if (WiFi.status() != WL_CONNECTED) return false;
 
-    time_t now = time(nullptr);
-    if (now < 1000000000L) {
-        Serial.println("⚠️ NTP 未同步，跳过 MQTT 连接");
-        return false;
-    }
-
-    String T = String((long)now);
-
-    // 涂鸦 MQTT 凭据生成
-    String clientId = "tuyalink_" + String(tuya_device_id);
-    String username = String(tuya_device_id)
-                      + "|signMethod=hmacSha256,timestamp=" + T
-                      + ",secureMode=1,accessType=1";
-    String signData = "deviceId=" + String(tuya_device_id)
-                      + ",timestamp=" + T
-                      + ",secureMode=1,accessType=1";
-    String password = hmacSha256(tuya_device_secret, signData);
-
-    wifiClient.setInsecure(); // 跳过 TLS 证书验证（DIY 场景适用）
-    mqtt.setServer(TUYA_HOST, TUYA_PORT);
+    mqtt.setServer(BEMFA_HOST, BEMFA_PORT);
     mqtt.setCallback(mqttCallback);
     mqtt.setKeepAlive(60);
-    mqtt.setBufferSize(1024);
+    mqtt.setBufferSize(256);
 
-    Serial.print("🔗 连接涂鸦云 MQTT...");
-    if (mqtt.connect(clientId.c_str(), username.c_str(), password.c_str())) {
-        String subTopic = "tylink/" + String(tuya_device_id)
-                          + "/thing/property/set";
-        mqtt.subscribe(subTopic.c_str());
-        Serial.println(" ✅ 已连接，订阅: " + subTopic);
-
-        // 上报当前设备属性，让涂鸦云将设备标记为在线（米家同步依赖此步骤）
-        {
-            String reportTopic = "tylink/" + String(tuya_device_id)
-                                 + "/thing/property/report";
-            JsonDocument rep;
-            rep["msgId"] = String(millis());
-            rep["time"]  = (long)time(nullptr) * 1000;
-            JsonObject repData = rep["data"].to<JsonObject>();
-            repData[tuya_dp_key]["value"] = false; // 初始状态：关
-            String repPayload;
-            serializeJson(rep, repPayload);
-            mqtt.publish(reportTopic.c_str(), repPayload.c_str());
-            Serial.println("📤 已上报初始状态到涂鸦云");
-        }
+    Serial.print("🔗 连接巴法云 MQTT...");
+    // 巴法云：ClientId = 私钥，无需 username/password
+    if (mqtt.connect(bemfa_uid)) {
+        mqtt.subscribe(bemfa_topic);
+        Serial.println(" ✅ 已连接，订阅主题: " + String(bemfa_topic));
         return true;
     }
     Serial.println(" ❌ 失败 (state=" + String(mqtt.state()) + ")");
@@ -725,8 +578,8 @@ void setup() {
     delay(1000);
 
     Serial.println("\n========================================");
-    Serial.println("  ESP32C3  BLE 唤醒小爱音箱 v6.0");
-    Serial.println("  方案: 涂鸦 IoT MQTT（无需设备认证）");
+    Serial.println("  ESP32C3  BLE 唤醒小爱音箱 v7.0");
+    Serial.println("  方案: 巴法云 MQTT");
     Serial.println("========================================");
 
     pinMode(TRIGGER_PIN,    INPUT_PULLUP);
@@ -751,7 +604,6 @@ void setup() {
     } else {
         connectWiFi();
         if (current_status == STATUS_CONNECTED) {
-            syncNTP();
             if (MDNS.begin("esp32c3-wake")) {
                 Serial.println("🌐 mDNS: http://esp32c3-wake.local");
             }
@@ -759,10 +611,10 @@ void setup() {
             webServer.begin();
             Serial.println("🌐 配置页: http://" + WiFi.localIP().toString());
             initWakeupBLE();
-            if (strlen(tuya_device_id) > 0 && strlen(tuya_device_secret) > 0) {
+            if (strlen(bemfa_uid) > 0 && strlen(bemfa_topic) > 0) {
                 mqttConnect();
             } else {
-                Serial.println("⚠️ 涂鸦云未配置，请访问配置页填写设备 ID 和密钥");
+                Serial.println("⚠️ 巴法云未配置，请访问配置页填写私钥和主题名");
             }
         }
     }

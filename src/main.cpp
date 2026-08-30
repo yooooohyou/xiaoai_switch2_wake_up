@@ -1,22 +1,30 @@
 /**
  * BLE 唤醒小爱音箱 (ESP32-C3)
- * 版本: 7.0 - 巴法云 MQTT 方案
+ * 版本: 6.1 - 涂鸦(Tuya) IoT 平台 MQTT 方案（TuyaLink 标准协议）
  *
  * 首次配置流程：
  *   1. 上电后 LED 快闪，设备开启配置热点 "ESP32_BLE_Wake"（密码 12345678）
  *   2. 手机连接热点 → 浏览器访问 192.168.4.1，填写 WiFi 账号密码
- *   3. 设备连上 WiFi 后，访问 http://esp32c3-wake.local 填写巴法云参数
+ *   3. 设备连上 WiFi 后，访问 http://esp32c3-wake.local 填写涂鸦参数
  *
- * 巴法云参数获取：
- *   cloud.bemfa.com → 私钥（UID）
- *                  → 设备管理 → 新建主题（类型选"插座"）→ 填写主题名
+ * 涂鸦参数获取：
+ *   iot.tuya.com → 产品开发 → 设备管理 → 设备详情 → 设备证书
+ *                 （DeviceID + DeviceSecret）
+ *   新版设备详情页不再展示 DP 标识符，因此本版本的「DP 标识符」为选填：
+ *   留空时固件会从云端下发的第一条指令中自动学习，并用它上报状态。
+ *   数据中心必须与项目所在区域一致，可在配置页选择：
+ *     中国 m1.tuyacn.com / 美西 m1.tuyaus.com / 欧洲 m1.tuyaeu.com / 印度 m1.tuyain.com
  *
- * 接入小爱音箱：
- *   在巴法云控制台绑定设备后，通过米家 App 或小爱音箱即可语音/手动控制
+ * 诊断：连上 WiFi 后访问 http://esp32c3-wake.local/status 查看
+ *       WiFi / NTP / MQTT 状态、剩余堆内存和最近一条云端指令。
+ *
+ * 接入涂鸦智能 App / 米家：
+ *   在涂鸦 IoT 平台配置产品后，用涂鸦智能 App 即可控制；
+ *   也可通过 Home Assistant Tuya 插件或 Matter Bridge 接入米家。
  *
  * 日常使用：
- *   App/语音"打开" → MQTT on → BLE 广播唤醒小爱音箱
- *   App/语音"关闭" → MQTT off → 停止广播
+ *   App"开" → MQTT set → BLE 广播唤醒小爱音箱
+ *   App"关" → MQTT set → 停止广播
  *
  * 按键操作：
  *   短按 → 配置模式：重启热点；正常模式：手动触发 BLE 广播测试
@@ -24,6 +32,7 @@
  */
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
@@ -31,8 +40,11 @@
 #include <BLEAdvertising.h>
 #include <esp_mac.h>
 #include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "mbedtls/md.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
+#include "time.h"
 
 // ==================== 引脚定义 ====================
 #define TRIGGER_PIN    9
@@ -47,14 +59,27 @@
 #define MQTT_RECONNECT_MS    8000
 #define WIFI_TIMEOUT_MS      30000
 #define WIFI_RECONNECT_MS    15000
+#define NTP_TIMEOUT_S        20
+#define MQTT_SOCKET_TIMEOUT_S 20
+#define MQTT_HEARTBEAT_MS    45000   // 定期上报属性，帮助云端维持在线判定
 
 // ==================== 配置热点 ====================
 #define SETUP_AP_SSID     "ESP32_BLE_Wake"
 #define SETUP_AP_PASSWORD "12345678"
 
-// ==================== 巴法云 MQTT ====================
-#define BEMFA_HOST "bemfa.com"
-#define BEMFA_PORT 9501
+// ==================== 涂鸦云 MQTT ====================
+// 接入地址由项目所在数据中心决定，选错会认证失败（state=5）
+#define DEFAULT_TUYA_HOST "m1.tuyacn.com"
+#define TUYA_PORT 8883
+
+struct TuyaRegion { const char* host; const char* label; };
+static const TuyaRegion TUYA_REGIONS[] = {
+    {"m1.tuyacn.com", "中国"},
+    {"m1.tuyaus.com", "美西"},
+    {"m1.tuyaeu.com", "欧洲"},
+    {"m1.tuyain.com", "印度"},
+};
+static const size_t TUYA_REGION_COUNT = sizeof(TUYA_REGIONS) / sizeof(TUYA_REGIONS[0]);
 
 // ==================== BLE ====================
 #define BLE_DEVICE_NAME "ESP32C3_BLE_Beacon"
@@ -64,12 +89,22 @@ const char* DEFAULT_BLE_MAC  = "78:81:8c:06:9a:c4";
 const char* DEFAULT_BLE_DATA = "0201061BFF53050100037E0566200001816D60168C81780F00000000000000";
 
 // ==================== 配置缓冲区（从 NVS 加载）====================
-char wifi_ssid[33]     = "";
-char wifi_pass[65]     = "";
-char bemfa_uid[65]     = "";   // 巴法云私钥（UID）
-char bemfa_topic[33]   = "";   // 巴法云主题名
-char ble_mac[19]       = "";
-char ble_data[65]      = "";
+char wifi_ssid[33]          = "";
+char wifi_pass[65]          = "";
+char tuya_device_id[25]     = "";   // 涂鸦设备 ID
+char tuya_device_secret[33] = "";   // 涂鸦设备密钥
+char tuya_dp_key[33]        = "";   // 开关 DP 标识符（留空 = 自动识别）
+char tuya_host[41]          = DEFAULT_TUYA_HOST; // 接入地址（数据中心）
+char ble_mac[19]            = "";
+char ble_data[65]           = "";
+
+// 运行时状态：从云端下发指令中学到的 DP 标识符，用于上报
+char          learned_dp_key[33] = "";
+String        lastCommandLog     = "";   // 最近一条云端指令，供 /status 查看
+int           lastMqttState      = -100; // 最近一次 MQTT 连接返回码
+unsigned long lastHeartbeat      = 0;
+uint32_t      mqttConnectCount   = 0;
+uint32_t      mqttFailCount      = 0;
 
 // ==================== BLE 广播数据 ====================
 uint8_t baseMAC[6] = {0x78, 0x81, 0x8c, 0x06, 0x9a, 0xc4};
@@ -103,28 +138,35 @@ BLEAdvertising* pWakeAdv       = nullptr;
 // ==================== 跨任务标志 ====================
 volatile bool pendingBLEStart = false;
 volatile bool pendingBLEStop  = false;
+volatile bool pendingReport   = false;
+bool          switchState     = false;   // 云端最后一次下发的开关状态
 
 // ==================== 重连计时 ====================
 unsigned long lastMqttAttempt = 0;
 unsigned long lastWifiAttempt = 0;
 
 // ==================== 对象 ====================
-Preferences prefs;
-WebServer   webServer(80);
-WiFiClient  wifiClient;
-PubSubClient mqtt(wifiClient);
-bool        apActive = false;
+Preferences       prefs;
+WebServer         webServer(80);
+WiFiClientSecure  wifiClient;
+PubSubClient      mqtt(wifiClient);
+bool              apActive = false;
 
 // ==================== 函数声明 ====================
 void loadConfig();
 void saveWiFiConfig(const String& ssid, const String& pass);
-void saveServiceConfig(const String& uid, const String& topic,
-                       const String& mac, const String& data);
+void saveServiceConfig(const String& deviceId, const String& secret,
+                       const String& dpKey,     const String& host,
+                       const String& mac,       const String& data);
 void startConfigAP();
 void stopConfigAP();
 void connectWiFi();
+void syncNTP();
+String hmacSha256(const char* key, const String& data);
 bool mqttConnect();
 void mqttCallback(char* topic, byte* payload, unsigned int len);
+void sendSetResponse(const String& msgId);
+void reportSwitchState(bool on);
 void handleMQTT();
 void initWakeupBLE();
 void startBLEAdvertising();
@@ -135,6 +177,8 @@ void updateStatusLED();
 void safeRestart(const char* reason);
 String buildWiFiPage();
 String buildServicePage();
+String buildStatusPage();
+const char* mqttStateText(int state);
 void registerAPRoutes();
 void registerLANRoutes();
 
@@ -145,20 +189,28 @@ void registerLANRoutes();
 void loadConfig() {
     if (!prefs.begin("config", true)) {
         prefs.end();
-        strcpy(ble_mac,  DEFAULT_BLE_MAC);
-        strcpy(ble_data, DEFAULT_BLE_DATA);
+        strcpy(ble_mac,   DEFAULT_BLE_MAC);
+        strcpy(ble_data,  DEFAULT_BLE_DATA);
+        strcpy(tuya_host, DEFAULT_TUYA_HOST);
         return;
     }
-    prefs.getString("wifi_ssid",  "").toCharArray(wifi_ssid,   sizeof(wifi_ssid));
-    prefs.getString("wifi_pass",  "").toCharArray(wifi_pass,   sizeof(wifi_pass));
-    prefs.getString("bemfa_uid",  "").toCharArray(bemfa_uid,   sizeof(bemfa_uid));
-    prefs.getString("bemfa_topic","").toCharArray(bemfa_topic, sizeof(bemfa_topic));
+    prefs.getString("wifi_ssid",    "").toCharArray(wifi_ssid,          sizeof(wifi_ssid));
+    prefs.getString("wifi_pass",    "").toCharArray(wifi_pass,          sizeof(wifi_pass));
+    prefs.getString("tuya_did",     "").toCharArray(tuya_device_id,     sizeof(tuya_device_id));
+    prefs.getString("tuya_secret",  "").toCharArray(tuya_device_secret, sizeof(tuya_device_secret));
+    prefs.getString("tuya_dp",      "").toCharArray(tuya_dp_key,        sizeof(tuya_dp_key));
+    prefs.getString("tuya_host", DEFAULT_TUYA_HOST).toCharArray(tuya_host, sizeof(tuya_host));
     prefs.getString("ble_mac",  DEFAULT_BLE_MAC).toCharArray(ble_mac,   sizeof(ble_mac));
     prefs.getString("ble_data", DEFAULT_BLE_DATA).toCharArray(ble_data, sizeof(ble_data));
     prefs.end();
 
+    if (strlen(tuya_host) == 0) strcpy(tuya_host, DEFAULT_TUYA_HOST);
+    strncpy(learned_dp_key, tuya_dp_key, sizeof(learned_dp_key) - 1);
+
     Serial.println("✅ 配置已加载 - WiFi: " + String(wifi_ssid)
-                   + "  巴法云主题: " + String(bemfa_topic));
+                   + "  涂鸦设备ID: " + String(tuya_device_id)
+                   + "  接入地址: " + String(tuya_host)
+                   + "  DP: " + (strlen(tuya_dp_key) ? String(tuya_dp_key) : String("自动识别")));
 }
 
 void saveWiFiConfig(const String& ssid, const String& pass) {
@@ -169,13 +221,16 @@ void saveWiFiConfig(const String& ssid, const String& pass) {
     Serial.println("💾 WiFi 配置已保存");
 }
 
-void saveServiceConfig(const String& uid, const String& topic,
-                       const String& mac, const String& data) {
+void saveServiceConfig(const String& deviceId, const String& secret,
+                       const String& dpKey,     const String& host,
+                       const String& mac,       const String& data) {
     if (!prefs.begin("config", false)) return;
-    prefs.putString("bemfa_uid",   uid);
-    prefs.putString("bemfa_topic", topic);
-    prefs.putString("ble_mac",  mac.length()  > 0 ? mac   : DEFAULT_BLE_MAC);
-    prefs.putString("ble_data", data.length() > 0 ? data  : DEFAULT_BLE_DATA);
+    prefs.putString("tuya_did",    deviceId);
+    prefs.putString("tuya_secret", secret);
+    prefs.putString("tuya_dp",     dpKey);   // 允许留空，由固件自动识别
+    prefs.putString("tuya_host",   host.length() > 0 ? host : DEFAULT_TUYA_HOST);
+    prefs.putString("ble_mac",     mac.length()  > 0 ? mac   : DEFAULT_BLE_MAC);
+    prefs.putString("ble_data",    data.length() > 0 ? data  : DEFAULT_BLE_DATA);
     prefs.end();
     Serial.println("💾 服务配置已保存");
 }
@@ -203,7 +258,7 @@ String buildWiFiPage() {
         ".tip{font-size:.82em;color:#aaa;margin-top:6px}"
         "</style></head><body>"
         "<h2>WiFi 配置</h2>"
-        "<p class='sub'>连接成功后，可通过局域网地址继续配置巴法云和 BLE 参数</p>"
+        "<p class='sub'>连接成功后，可通过局域网地址继续配置涂鸦云和 BLE 参数</p>"
         "<form method='POST' action='/save-wifi'>"
         "<label>WiFi 名称 (SSID)</label>"
         "<input type='text' name='ssid' value='" + String(wifi_ssid) + "' required "
@@ -217,13 +272,35 @@ String buildWiFiPage() {
         "</body></html>";
 }
 
-// ---- 局域网页：巴法云 + BLE 配置 ----
+// ---- 局域网页：涂鸦云 + BLE 配置 ----
 String buildServicePage() {
-    bool bemfaOk = (strlen(bemfa_uid) > 0 && strlen(bemfa_topic) > 0);
+    bool tuyaOk = (strlen(tuya_device_id) > 0 && strlen(tuya_device_secret) > 0);
 
-    String statusBar = bemfaOk
-        ? "<div class='ok'>巴法云已配置 &nbsp; 主题: <b>" + String(bemfa_topic) + "</b></div>"
-        : "<div class='warn'>巴法云尚未配置，设备暂无法接收控制指令</div>";
+    String statusBar;
+    if (!tuyaOk) {
+        statusBar = "<div class='warn'>涂鸦云尚未配置，设备暂无法接收控制指令</div>";
+    } else if (mqtt.connected()) {
+        statusBar = "<div class='ok'>涂鸦云已连接 &nbsp; 设备ID: <b>"
+                    + String(tuya_device_id) + "</b></div>";
+    } else {
+        statusBar = "<div class='warn'>涂鸦云未连接（" + String(mqttStateText(lastMqttState))
+                    + "） &nbsp; 设备ID: <b>" + String(tuya_device_id) + "</b></div>";
+    }
+
+    String hostOptions = "";
+    bool matched = false;
+    for (size_t i = 0; i < TUYA_REGION_COUNT; i++) {
+        bool sel = (strcmp(tuya_host, TUYA_REGIONS[i].host) == 0);
+        if (sel) matched = true;
+        hostOptions += "<option value='" + String(TUYA_REGIONS[i].host) + "'"
+                       + (sel ? " selected" : "") + ">"
+                       + String(TUYA_REGIONS[i].label) + " - "
+                       + String(TUYA_REGIONS[i].host) + "</option>";
+    }
+    if (!matched) {
+        hostOptions = "<option value='" + String(tuya_host) + "' selected>"
+                      + String(tuya_host) + "</option>" + hostOptions;
+    }
 
     return
         "<!DOCTYPE html><html><head>"
@@ -234,12 +311,13 @@ String buildServicePage() {
         "h2{margin-bottom:4px}"
         "h3{margin:0 0 6px;font-size:1em;color:#555}"
         "label{display:block;margin-top:14px;font-weight:bold;font-size:.9em}"
-        "input[type=text]{"
-        "  width:100%;box-sizing:border-box;padding:9px;"
+        "input[type=text],select{"
+        "  width:100%;box-sizing:border-box;padding:9px;background:#fff;"
         "  border:1px solid #ddd;border-radius:6px;font-size:.95em;margin-top:4px}"
         "input[type=submit]{width:100%;background:#1989fa;color:#fff;border:none;"
         "  padding:12px;border-radius:8px;font-size:1em;margin-top:20px;cursor:pointer}"
         "hr{border:none;border-top:1px solid #eee;margin:20px 0}"
+        "a{color:#1989fa}"
         ".tip{font-size:.82em;color:#aaa;margin-top:5px;line-height:1.5}"
         ".ok{background:#f0f9eb;border:1px solid #b3e19d;border-radius:8px;"
         "  padding:10px 14px;margin-bottom:16px;font-size:.9em}"
@@ -250,17 +328,28 @@ String buildServicePage() {
         + statusBar +
         "<form method='POST' action='/save'>"
 
-        "<hr><h3>巴法云 MQTT</h3>"
+        "<hr><h3>涂鸦云 IoT</h3>"
         "<p class='tip'>"
-        "登录 <b>cloud.bemfa.com</b> → 右上角头像 → 私钥（复制整串）<br>"
-        "设备管理 → 新建主题 → 类型选<b>插座</b> → 填写主题名（字母+数字）"
+        "iot.tuya.com → 产品开发 → 设备管理 → 设备详情 → <b>设备证书</b><br>"
+        "<b>数据中心必须与项目所在区域一致</b>，选错会认证失败"
         "</p>"
-        "<label>私钥（UID）</label>"
-        "<input type='text' name='uid' value='" + String(bemfa_uid) + "' required "
-        "placeholder='巴法云控制台右上角私钥'>"
-        "<label>主题名</label>"
-        "<input type='text' name='topic' value='" + String(bemfa_topic) + "' required "
-        "placeholder='例如: switch001'>"
+        "<label>设备 ID（Device ID）</label>"
+        "<input type='text' name='did' value='" + String(tuya_device_id) + "' required "
+        "placeholder='26c24759c1344038xxxxxx'>"
+        "<label>设备密钥（Device Secret）</label>"
+        "<input type='text' name='secret' value='" + String(tuya_device_secret) + "' required "
+        "placeholder='XXXXXXXXXXXXXXXX'>"
+        "<label>数据中心</label>"
+        "<select name='host'>" + hostOptions + "</select>"
+        "<label>开关 DP 标识符（选填）</label>"
+        "<input type='text' name='dp' value='" + String(tuya_dp_key) + "' "
+        "placeholder='留空则自动识别'>"
+        "<p class='tip'>"
+        "新版设备详情页不再显示标识符，留空即可——固件会从云端下发的第一条指令里"
+        "自动学到它，并用同一个标识符回报状态。<br>"
+        "如果设备详情里「绑定用户 / 绑定 APP」为空，说明还没在涂鸦智能 App 里绑定这台设备，"
+        "此时 App 无法下发指令。"
+        "</p>"
 
         "<hr><h3>BLE 唤醒目标</h3>"
         "<p class='tip'>留空使用默认值；如需唤醒特定音箱，填写其 BLE MAC 和广播数据</p>"
@@ -274,6 +363,77 @@ String buildServicePage() {
 
         "<input type='submit' value='保存并重启'>"
         "</form>"
+        "</body></html>";
+}
+
+// ---- MQTT 返回码释义（PubSubClient state()）----
+const char* mqttStateText(int state) {
+    switch (state) {
+        case -100: return "尚未尝试连接";
+        case -4: return "-4 服务器无响应，可能是地址/端口不通";
+        case -3: return "-3 连接被断开";
+        case -2: return "-2 TCP/TLS 建连失败，检查网络与数据中心地址";
+        case -1: return "-1 已主动断开";
+        case  0: return "0 已连接";
+        case  1: return "1 协议版本不被接受";
+        case  2: return "2 ClientID 被拒绝";
+        case  3: return "3 服务不可用";
+        case  4: return "4 用户名或密码错误，检查 DeviceSecret 与设备时间";
+        case  5: return "5 认证未通过，检查 DeviceID / Secret / 数据中心是否匹配";
+        default: return "未知状态";
+    }
+}
+
+// ---- 局域网诊断页 /status ----
+String buildStatusPage() {
+    time_t now = time(nullptr);
+    struct tm tmv;
+    char timeStr[32] = "未同步";
+    if (now > 1000000000L) {
+        localtime_r(&now, &tmv);
+        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &tmv);
+    }
+
+    String dpShown = strlen(learned_dp_key) ? String(learned_dp_key) : String("尚未识别");
+
+    String rows = "";
+    auto row = [&rows](const String& k, const String& v) {
+        rows += "<tr><td>" + k + "</td><td>" + v + "</td></tr>";
+    };
+
+    row("WiFi", WiFi.status() == WL_CONNECTED
+                ? "已连接 " + WiFi.SSID() + " (" + WiFi.localIP().toString()
+                  + ", RSSI " + String(WiFi.RSSI()) + " dBm)"
+                : "未连接");
+    row("NTP 时间", String(timeStr));
+    row("涂鸦地址", String(tuya_host) + ":" + String(TUYA_PORT));
+    row("设备 ID", String(tuya_device_id));
+    row("MQTT", mqtt.connected() ? "已连接" : "未连接");
+    row("最近返回码", String(mqttStateText(lastMqttState)));
+    row("连接成功 / 失败次数", String(mqttConnectCount) + " / " + String(mqttFailCount));
+    row("DP 标识符", dpShown);
+    row("最近一条指令", lastCommandLog.length() ? lastCommandLog : "无");
+    row("BLE", bleInitialized ? "已初始化" : "未初始化");
+    row("剩余堆内存", String(ESP.getFreeHeap()) + " B（最低 "
+                     + String(ESP.getMinFreeHeap()) + " B）");
+    row("运行时长", String(millis() / 1000) + " s");
+
+    return
+        "<!DOCTYPE html><html><head>"
+        "<meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<meta http-equiv='refresh' content='5'>"
+        "<style>"
+        "body{font-family:sans-serif;padding:20px;max-width:520px;margin:auto;color:#333}"
+        "table{width:100%;border-collapse:collapse;font-size:.9em}"
+        "td{padding:8px 6px;border-bottom:1px solid #eee;vertical-align:top}"
+        "td:first-child{color:#888;width:38%}"
+        "a{color:#1989fa;margin-right:14px}"
+        "</style></head><body>"
+        "<h2>运行状态</h2>"
+        "<table>" + rows + "</table>"
+        "<p><a href='/'>配置页</a><a href='/wake'>手动触发 BLE 唤醒</a></p>"
+        "<p style='color:#aaa;font-size:.8em'>本页每 5 秒自动刷新</p>"
         "</body></html>";
 }
 
@@ -296,7 +456,7 @@ void registerAPRoutes() {
             "<meta charset='UTF-8'>"
             "<p style='font-family:sans-serif;padding:20px'>"
             "✅ WiFi 已保存，设备重启中...<br>"
-            "<small>连接成功后请访问 <b>http://esp32c3-wake.local</b> 配置巴法云参数</small>"
+            "<small>连接成功后请访问 <b>http://esp32c3-wake.local</b> 配置涂鸦云参数</small>"
             "</p>");
         delay(800);
         ESP.restart();
@@ -308,19 +468,33 @@ void registerLANRoutes() {
         webServer.send(200, "text/html; charset=utf-8", buildServicePage());
     });
 
-    webServer.on("/save", HTTP_POST, []() {
-        String uid   = webServer.arg("uid");
-        String topic = webServer.arg("topic");
-        String mac   = webServer.arg("mac");
-        String data  = webServer.arg("data");
+    webServer.on("/status", HTTP_GET, []() {
+        webServer.send(200, "text/html; charset=utf-8", buildStatusPage());
+    });
 
-        if (uid.length() == 0 || topic.length() == 0) {
+    // 手动触发一次 BLE 唤醒广播，用于不依赖涂鸦云的联调
+    webServer.on("/wake", HTTP_GET, []() {
+        pendingBLEStart = true;
+        webServer.send(200, "text/html; charset=utf-8",
+            "<meta charset='UTF-8'><p style='font-family:sans-serif;padding:20px'>"
+            "📡 已触发 BLE 唤醒广播，<a href='/status'>返回状态页</a></p>");
+    });
+
+    webServer.on("/save", HTTP_POST, []() {
+        String did    = webServer.arg("did");
+        String secret = webServer.arg("secret");
+        String dp     = webServer.arg("dp");
+        String host   = webServer.arg("host");
+        String mac    = webServer.arg("mac");
+        String data   = webServer.arg("data");
+
+        if (did.length() == 0 || secret.length() == 0) {
             webServer.send(400, "text/html; charset=utf-8",
                 "<meta charset='UTF-8'>"
-                "<p style='font-family:sans-serif;padding:20px'>❌ 私钥和主题名为必填项</p>");
+                "<p style='font-family:sans-serif;padding:20px'>❌ 设备 ID 和设备密钥为必填项</p>");
             return;
         }
-        saveServiceConfig(uid, topic, mac, data);
+        saveServiceConfig(did, secret, dp, host, mac, data);
         webServer.send(200, "text/html; charset=utf-8",
             "<meta charset='UTF-8'>"
             "<p style='font-family:sans-serif;padding:20px'>✅ 已保存，设备重启中...</p>");
@@ -376,46 +550,205 @@ void connectWiFi() {
 }
 
 // =====================================================
-// MQTT（巴法云）
+// NTP 时间同步（涂鸦 HMAC 签名需要时间戳）
+// =====================================================
+
+void syncNTP() {
+    configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org");
+    Serial.print("🕐 同步 NTP 时间");
+    time_t now = 0;
+    int retry = 0;
+    while (now < 1000000000L && retry < NTP_TIMEOUT_S * 2) {
+        delay(500);
+        esp_task_wdt_reset();
+        Serial.print(".");
+        time(&now);
+        retry++;
+    }
+    if (now > 1000000000L) {
+        Serial.println(" ✅ 时间戳: " + String((long)now));
+    } else {
+        Serial.println(" ⚠️ 同步超时，MQTT 可能无法连接");
+    }
+}
+
+// =====================================================
+// HMAC-SHA256（涂鸦签名认证）
+// =====================================================
+
+String hmacSha256(const char* key, const String& data) {
+    uint8_t hmac[32];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+    mbedtls_md_hmac_starts(&ctx, (const uint8_t*)key, strlen(key));
+    mbedtls_md_hmac_update(&ctx, (const uint8_t*)data.c_str(), data.length());
+    mbedtls_md_hmac_finish(&ctx, hmac);
+    mbedtls_md_free(&ctx);
+
+    String result = "";
+    for (int i = 0; i < 32; i++) {
+        if (hmac[i] < 0x10) result += "0";
+        result += String(hmac[i], HEX);
+    }
+    return result;
+}
+
+// =====================================================
+// MQTT（涂鸦云）
 // =====================================================
 
 void mqttCallback(char* topicStr, byte* payload, unsigned int len) {
-    String msg = "";
-    for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
-    msg.toLowerCase();
-    msg.trim();
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload, len);
+    if (err) {
+        Serial.println("⚠️ JSON 解析失败: " + String(err.c_str()));
+        return;
+    }
 
-    Serial.println("📨 巴法云消息 [" + String(topicStr) + "]: " + msg);
+    String msgId = doc["msgId"] | "";
+    JsonObject data = doc["data"].as<JsonObject>();
+    if (data.isNull()) return;
 
-    if (msg == "on" || msg == "1") {
-        pendingBLEStart = true;
-        digitalWrite(STATUS_LED_PIN, HIGH);
-        Serial.println("→ 触发 BLE 唤醒广播");
-    } else if (msg == "off" || msg == "0") {
-        pendingBLEStop = true;
-        digitalWrite(STATUS_LED_PIN, LOW);
-        Serial.println("→ 停止 BLE 广播");
+    // 从 DP 值中提取布尔值：兼容两种格式
+    //   标准物模型: {"switch_1": {"value": true}}
+    //   简单格式:   {"5346": true}
+    auto extractBool = [](JsonVariant v) -> bool {
+        if (v.is<JsonObject>()) return v["value"].as<bool>();
+        return v.as<bool>();
+    };
+
+    // 优先匹配配置的 DP 标识符，找不到时遍历所有 DP 取第一个布尔值
+    bool found = false;
+    bool switchOn = false;
+    String matchedKey = "";
+
+    if (!data[tuya_dp_key].isNull()) {
+        switchOn  = extractBool(data[tuya_dp_key]);
+        matchedKey = String(tuya_dp_key);
+        found = true;
+    } else {
+        for (JsonPair kv : data) {
+            JsonVariant v = kv.value();
+            if (v.is<bool>() || (v.is<JsonObject>() && !v["value"].isNull())) {
+                switchOn   = extractBool(v);
+                matchedKey = kv.key().c_str();
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if (found) {
+        // 记住云端实际使用的标识符，后续上报沿用它
+        if (matchedKey.length() > 0 && matchedKey != String(learned_dp_key)) {
+            strncpy(learned_dp_key, matchedKey.c_str(), sizeof(learned_dp_key) - 1);
+            learned_dp_key[sizeof(learned_dp_key) - 1] = '\0';
+            Serial.println("🔎 已识别 DP 标识符: " + matchedKey);
+        }
+        lastCommandLog = matchedKey + " = " + String(switchOn ? "ON" : "OFF");
+        switchState    = switchOn;
+        pendingReport  = true;   // 回报状态放到主循环，避免在回调里发布
+
+        Serial.println("📨 涂鸦指令 [" + matchedKey + "]: "
+                       + String(switchOn ? "ON" : "OFF"));
+        if (switchOn) {
+            pendingBLEStart = true;
+            digitalWrite(STATUS_LED_PIN, HIGH);
+        } else {
+            pendingBLEStop = true;
+            digitalWrite(STATUS_LED_PIN, LOW);
+        }
+        if (msgId.length() > 0) sendSetResponse(msgId);
+    }
+}
+
+void sendSetResponse(const String& msgId) {
+    String topic = "tylink/" + String(tuya_device_id)
+                   + "/thing/property/set_response";
+    JsonDocument doc;
+    doc["msgId"] = msgId;
+    doc["time"]  = (long)time(nullptr) * 1000;
+    doc["code"]  = 0;
+    String payload;
+    serializeJson(doc, payload);
+    mqtt.publish(topic.c_str(), payload.c_str());
+}
+
+// 上报开关状态。标识符未知时跳过——涂鸦要求 data 的 key 与物模型一致
+void reportSwitchState(bool on) {
+    if (!mqtt.connected() || strlen(learned_dp_key) == 0) return;
+
+    String topic = "tylink/" + String(tuya_device_id) + "/thing/property/report";
+    JsonDocument doc;
+    doc["msgId"] = String(millis());
+    doc["time"]  = (long)time(nullptr) * 1000;
+    JsonObject data = doc["data"].to<JsonObject>();
+    data[learned_dp_key]["value"] = on;
+    String payload;
+    serializeJson(doc, payload);
+    if (!mqtt.publish(topic.c_str(), payload.c_str())) {
+        Serial.println("⚠️ 属性上报失败，可能连接已断开");
     }
 }
 
 bool mqttConnect() {
-    if (strlen(bemfa_uid) == 0 || strlen(bemfa_topic) == 0) return false;
+    if (strlen(tuya_device_id) == 0 || strlen(tuya_device_secret) == 0) return false;
     if (WiFi.status() != WL_CONNECTED) return false;
 
-    mqtt.setServer(BEMFA_HOST, BEMFA_PORT);
+    time_t now = time(nullptr);
+    if (now < 1000000000L) {
+        Serial.println("⚠️ NTP 未同步，跳过 MQTT 连接");
+        return false;
+    }
+
+    // 涂鸦要求 10 位秒级时间戳，设备时间偏差过大会认证失败
+    String T = String((long)now);
+
+    // 涂鸦 MQTT 凭据生成
+    String clientId = "tuyalink_" + String(tuya_device_id);
+    String username = String(tuya_device_id)
+                      + "|signMethod=hmacSha256,timestamp=" + T
+                      + ",secureMode=1,accessType=1";
+    String signData = "deviceId=" + String(tuya_device_id)
+                      + ",timestamp=" + T
+                      + ",secureMode=1,accessType=1";
+    String password = hmacSha256(tuya_device_secret, signData);
+
+    wifiClient.setInsecure(); // 跳过 TLS 证书验证（DIY 场景适用）
+    mqtt.setServer(tuya_host, TUYA_PORT);
     mqtt.setCallback(mqttCallback);
     mqtt.setKeepAlive(60);
-    mqtt.setBufferSize(256);
+    mqtt.setSocketTimeout(MQTT_SOCKET_TIMEOUT_S);
+    mqtt.setBufferSize(1024);
 
-    Serial.print("🔗 连接巴法云 MQTT...");
-    // 巴法云：ClientId = 私钥，无需 username/password
-    if (mqtt.connect(bemfa_uid)) {
-        mqtt.subscribe(bemfa_topic);
-        Serial.println(" ✅ 已连接，订阅主题: " + String(bemfa_topic));
-        return true;
+    Serial.printf("🔗 连接涂鸦云 %s:%d  时间戳=%s  剩余堆=%u B\n",
+                  tuya_host, TUYA_PORT, T.c_str(), ESP.getFreeHeap());
+
+    bool ok = mqtt.connect(clientId.c_str(), username.c_str(), password.c_str());
+    lastMqttState = mqtt.state();
+
+    if (!ok) {
+        mqttFailCount++;
+        Serial.printf("   ❌ 失败: %s  剩余堆=%u B\n",
+                      mqttStateText(lastMqttState), ESP.getFreeHeap());
+        return false;
     }
-    Serial.println(" ❌ 失败 (state=" + String(mqtt.state()) + ")");
-    return false;
+
+    mqttConnectCount++;
+    String subTopic = "tylink/" + String(tuya_device_id) + "/thing/property/set";
+    mqtt.subscribe(subTopic.c_str());
+    Serial.println("   ✅ 已连接，订阅: " + subTopic);
+
+    // 上报当前属性，让涂鸦云把设备标记为在线（米家同步依赖此步骤）
+    if (strlen(learned_dp_key) > 0) {
+        reportSwitchState(switchState);
+        Serial.println("   📤 已上报初始状态 [" + String(learned_dp_key) + "]");
+    } else {
+        Serial.println("   ℹ️ DP 标识符未知，等待云端下发第一条指令后自动识别");
+    }
+    lastHeartbeat = millis();
+    return true;
 }
 
 void handleMQTT() {
@@ -429,12 +762,25 @@ void handleMQTT() {
     }
 
     if (!mqtt.connected()) {
+        int state = mqtt.state();
+        if (state != lastMqttState) {
+            lastMqttState = state;
+            Serial.printf("📴 MQTT 断开: %s  剩余堆=%u B\n",
+                          mqttStateText(state), ESP.getFreeHeap());
+        }
         if (millis() - lastMqttAttempt > MQTT_RECONNECT_MS) {
             lastMqttAttempt = millis();
             mqttConnect();
         }
-    } else {
-        mqtt.loop();
+        return;
+    }
+
+    mqtt.loop();
+
+    // 定期上报属性：既是保活，也让云端持续看到设备活跃
+    if (millis() - lastHeartbeat > MQTT_HEARTBEAT_MS) {
+        lastHeartbeat = millis();
+        reportSwitchState(switchState);
     }
 }
 
@@ -561,7 +907,7 @@ void checkButton() {
                 startConfigAP();
             } else {
                 Serial.println("🔘 短按: 手动触发 BLE 唤醒广播 (测试)");
-                if (bleInitialized) startBLEAdvertising();
+                startBLEAdvertising();
             }
         }
     }
@@ -578,8 +924,8 @@ void setup() {
     delay(1000);
 
     Serial.println("\n========================================");
-    Serial.println("  ESP32C3  BLE 唤醒小爱音箱 v7.0");
-    Serial.println("  方案: 巴法云 MQTT");
+    Serial.println("  ESP32C3  BLE 唤醒小爱音箱 v6.1");
+    Serial.println("  方案: 涂鸦 IoT TuyaLink MQTT");
     Serial.println("========================================");
 
     pinMode(TRIGGER_PIN,    INPUT_PULLUP);
@@ -604,18 +950,25 @@ void setup() {
     } else {
         connectWiFi();
         if (current_status == STATUS_CONNECTED) {
+            syncNTP();
             if (MDNS.begin("esp32c3-wake")) {
                 Serial.println("🌐 mDNS: http://esp32c3-wake.local");
             }
             registerLANRoutes();
             webServer.begin();
             Serial.println("🌐 配置页: http://" + WiFi.localIP().toString());
-            initWakeupBLE();
-            if (strlen(bemfa_uid) > 0 && strlen(bemfa_topic) > 0) {
+            Serial.println("🩺 状态页: http://" + WiFi.localIP().toString() + "/status");
+
+            // 先建立 TLS/MQTT 连接，再初始化 BLE：
+            // 蓝牙协议栈会占用几十 KB 堆，握手阶段把内存留给 TLS 更稳
+            if (strlen(tuya_device_id) > 0 && strlen(tuya_device_secret) > 0) {
                 mqttConnect();
             } else {
-                Serial.println("⚠️ 巴法云未配置，请访问配置页填写私钥和主题名");
+                Serial.println("⚠️ 涂鸦云未配置，请访问配置页填写设备 ID 和密钥");
             }
+            Serial.printf("🧠 BLE 初始化前剩余堆: %u B\n", ESP.getFreeHeap());
+            initWakeupBLE();
+            Serial.printf("🧠 BLE 初始化后剩余堆: %u B\n", ESP.getFreeHeap());
         }
     }
 
@@ -635,11 +988,15 @@ void loop() {
 
     if (pendingBLEStart) {
         pendingBLEStart = false;
-        if (bleInitialized) startBLEAdvertising();
+        startBLEAdvertising();   // 未初始化时在内部惰性初始化 BLE
     }
     if (pendingBLEStop) {
         pendingBLEStop = false;
         stopBLEAdvertising();
+    }
+    if (pendingReport) {
+        pendingReport = false;
+        reportSwitchState(switchState);
     }
 
     delay(10);
